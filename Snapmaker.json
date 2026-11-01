@@ -295,6 +295,10 @@
       "sub_path": "process/0.24 Standard @Snapmaker Artisan (0.6 nozzle).json"
     },
     {
+      "name": "0.24 Standard @Snapmaker (0.8 nozzle)",
+      "sub_path": "process/0.24 Standard @Snapmaker (0.8 nozzle).json"
+    },
+    {
       "name": "0.24 Standard @Snapmaker J1 (0.8 nozzle)",
       "sub_path": "process/0.24 Standard @Snapmaker J1 (0.8 nozzle).json"
     },
