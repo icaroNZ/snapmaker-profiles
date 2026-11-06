@@ -99,7 +99,7 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
 17bf0bb validator; c7757d9 SnapSpeed `filament_density` 1.25; 252a7a2 re-index `0.24 Standard @Snapmaker (0.8 nozzle)`
 (default of all 16 SM2 0.8 mm printers); 3ff1148 version 02.03.04.05+a250t; 497718b J1 `default_filament_profile`
 -> `Snapmaker PLA @J1`/`Snapmaker PETG @J1`, BOM removed from `fdm_process_common.json` and one U1 process;
-f0d147d version 02.03.04.06+a250t; 0655774 restore CRLF in `fdm_idex.json`. Details:
+f0d147d version 02.03.04.06+a250t; 0655774 restore CRLF in `fdm_idex.json`; 0f53633 restore CRLF in `Snapmaker.json`. Details:
 `../_snapmaker2-review/integration/snapmaker-profiles.md`.
 
 ## Cross-repo interfaces
@@ -124,7 +124,7 @@ specialist agent: `sm-profiles`.
 - Do not change OrcaSlicer's `submodules/Profiles` gitlink from this repo's work unless explicitly asked; it is an
   OrcaSlicer commit.
 - **Keep line endings.** Most presets are CRLF. Two a250t commits converted files by accident (497718b `fdm_idex.json`,
-  fixed in 0655774; f0d147d turned `Snapmaker.json` from CRLF to LF - still LF, upstream is CRLF). Use Edit, not
+  fixed in 0655774; f0d147d turned `Snapmaker.json` from CRLF to LF - restored to CRLF in 0f53633). Use Edit, not
   `json.dump`; check `grep -c $'\r' <file>` before and `git diff --stat` after (a whole-file diff = broken endings).
 - Do not re-serialise or pretty-print files; do not reorder index lists (order = load order).
 - Do not `git add .` or `git add -A`: the root `.DS_Store` is untracked. `Snapmaker/.DS_Store` is tracked by mistake
