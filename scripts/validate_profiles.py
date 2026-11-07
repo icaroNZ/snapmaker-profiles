@@ -38,6 +38,10 @@ on) when it loads ``Snapmaker.json`` in ``PresetBundle::load_vendor_configs_from
   SM2-GC-PAUSE  machine_pause_gcode resolves to a template with an M600 line (Orca's
                 "Pause" item writes only this key after ;PAUSE_PRINT; an empty value
                 means the print never stops; M600 is the controller's runout pause)
+  SM2-GC-PURGE  start G-code purge line uses Orca's first-layer footprint, nozzle and filament MVS
+                placeholders, and (rendered offline by render_start_gcode.py for sample footprints) every
+                G0/G1 stays on the bed and outside bed_exclude_area, the purge line keeps clear of the
+                footprint unless it falls back to the old X40 Y0 line, and its flow stays <= filament MVS
 
 Findings that involve the Snapmaker 2.0 A250/A350 presets (directly, or as a
 base of them) are ERRORs and make the script exit with status 1. Findings on
@@ -49,6 +53,7 @@ Usage:  python3 scripts/validate_profiles.py [--root DIR] [--orca-filament-libra
 
 import argparse
 import glob
+import importlib.util
 import json
 import logging
 import os
@@ -100,6 +105,13 @@ GCODE_KEYS = ("machine_start_gcode", "machine_end_gcode", "change_filament_gcode
 SM2_TWINS = (("fdm_a250", "fdm_a350"), ("fdm_a250_dual", "fdm_a350_dual"))
 DRIFT_KEYS = ("machine_start_gcode", "machine_end_gcode", "change_filament_gcode", "before_layer_change_gcode",
               "machine_pause_gcode")
+# SM2-GC-PURGE (PR-09): placeholders the purge must use (Orca GCode.cpp:3040-3042 first_layer_print_*, PrintConfig
+# nozzle_diameter / filament_max_volumetric_speed coFloats), the comment it writes, and its limits.
+PURGE_PLACEHOLDERS = ("first_layer_print_min", "first_layer_print_max", "nozzle_diameter[",
+                      "filament_max_volumetric_speed[", "print_bed_min", "print_bed_max")
+PURGE_MARKER_RE = re.compile(r"^; SM2_PURGE (front|left|right|fallback) start X(-?[\d.]+) Y(-?[\d.]+)", re.M)
+PURGE_MAX_F = 3420.0          # mm/min, the old fixed purge feed
+PURGE_CLEARANCE = 4.0         # mm between purge extrusion and first-layer footprint (template: 5 mm)
 SM2_PRINTER_RE = re.compile(r"^Snapmaker (A250|A350)( Dual)?( QSKit| BKit| QS\+B Kit)? \((\d+(?:\.\d+)?) nozzle\)$")
 
 
@@ -271,6 +283,133 @@ def rule_gc_pause(text):
         return [("SM2-GC-PAUSE", "%r has no M600 line; M600 is the G-code that triggers the SM2's"
                                  " screen pause/runout flow (M600.cpp:163-174)" % "\n".join(lines)[:60])]
     return []
+
+
+def _load_renderer():
+    """scripts/render_start_gcode.py, loaded by path (python3 -I does not put the script dir on sys.path)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render_start_gcode.py")
+    spec = importlib.util.spec_from_file_location("render_start_gcode", path)
+    mod = importlib.util.module_from_spec(spec)
+    keep, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # no scripts/__pycache__ in the repo
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = keep
+    return mod
+
+
+_RENDERER = []
+_PURGE_CACHE = {}
+
+
+def renderer():
+    if not _RENDERER:
+        _RENDERER.append(_load_renderer())
+    return _RENDERER[0]
+
+
+def purge_footprints(usable):
+    """Sample first-layer footprints (x0, y0, x1, y1) on the usable bed; the bool says a side must have room."""
+    x0, y0, x1, y1 = usable
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    return [
+        ("front-left corner", (x0, y0, x0 + 30, y0 + 30), True),
+        ("front-right corner", (x1 - 30, y0, x1, y0 + 30), True),
+        ("back-left corner", (x0, y1 - 30, x0 + 30, y1), True),
+        ("back-right corner", (x1 - 30, y1 - 30, x1, y1), True),
+        ("centre", (cx - 25, cy - 25, cx + 25, cy + 25), True),
+        ("full-depth strip at the left edge", (x0, y0, x0 + 20, y1), True),
+        ("full-depth strip in the middle", (cx - 15, y0, cx + 15, y1), True),
+        ("full-width strip at the front", (x0, y0, x1, y0 + 20), False),
+        ("near-full bed", (x0 + 5, y0 + 5, x1 - 5, y1 - 5), False),
+    ]
+
+
+def _rect_gap(seg, rect):
+    """Distance between an axis-aligned segment's bbox and a rectangle (0 when they overlap)."""
+    sx0, sx1 = sorted((seg[0], seg[2]))
+    sy0, sy1 = sorted((seg[1], seg[3]))
+    dx = max(rect[0] - sx1, sx0 - rect[2], 0.0)
+    dy = max(rect[1] - sy1, sy0 - rect[3], 0.0)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def check_purge_render(start, cfg, footprint, initial_extruder, mvs, must_have_room):
+    """Render the start G-code for one footprint; return a list of problem strings (empty = fine)."""
+    rsg = renderer()
+    bed, excl = rsg.bed_geometry(cfg)
+    try:
+        text, local = rsg.render(start, rsg.sample_variables(cfg, footprint, initial_extruder, mvs), initial_extruder)
+        moves = rsg.gcode_moves(text)
+    except rsg.RenderError as exc:
+        return ["does not render: %s" % exc]
+    m = PURGE_MARKER_RE.search(text)
+    if not m:
+        return ["rendered G-code has no '; SM2_PURGE <side> start X.. Y..' line"]
+    side = m.group(1)
+    problems = []
+    if must_have_room and side == "fallback":
+        problems.append("falls back to the X40 Y0 line although the footprint leaves room beside it")
+    fil_d = 1.75
+    fil_area = 3.14159265 * fil_d * fil_d / 4.0
+    for mv in moves:
+        if not mv["xy"]:
+            continue
+        x, y = mv["x"], mv["y"]
+        if x is None or y is None:
+            continue  # first move after G28 sets only one axis; the other is the (unknown) home position
+        if not (bed[0] - 1e-6 <= x <= bed[2] + 1e-6 and bed[1] - 1e-6 <= y <= bed[3] + 1e-6):
+            problems.append("%r leaves the bed %s" % (mv["line"], bed))
+        for ex in excl:
+            if ex[0] < x < ex[2] and ex[1] < y < ex[3]:
+                problems.append("%r is inside bed_exclude_area %s" % (mv["line"], ex))
+        if not mv["e"] or mv["e"] <= 0 or mv["x0"] is None or mv["y0"] is None:
+            continue
+        seg = (mv["x0"], mv["y0"], x, y)
+        length = ((x - mv["x0"]) ** 2 + (y - mv["y0"]) ** 2) ** 0.5
+        if side != "fallback" and _rect_gap(seg, footprint) < PURGE_CLEARANCE:
+            problems.append("%r comes within %g mm of the footprint %s" % (mv["line"], PURGE_CLEARANCE, footprint))
+        f = mv["f"]
+        if f is not None and length > 0:
+            if f > PURGE_MAX_F + 1e-6:
+                problems.append("%r feed above %g" % (mv["line"], PURGE_MAX_F))
+            flow = mv["e"] / length * fil_area * f / 60.0
+            limit = mvs[initial_extruder] if isinstance(mvs, list) else mvs
+            if limit > 0 and flow > limit * 1.01:
+                problems.append("%r flows %.2f mm3/s > filament MVS %g" % (mv["line"], flow, limit))
+    return problems
+
+
+def rule_gc_purge(start, cfg):
+    """SM2-GC-PURGE (PR-09) for one resolved SM2 printer preset."""
+    text = str(start or "")
+    missing = [p for p in PURGE_PLACEHOLDERS if p not in text]
+    if missing:
+        return [("SM2-GC-PURGE", "purge does not use Orca placeholder(s) %s (footprint/nozzle/MVS-aware purge,"
+                                 " PR-09)" % ", ".join(missing))]
+    rsg = renderer()
+    nozzles = as_list(cfg.get("nozzle_diameter"))
+    key = (text, tuple(nozzles), tuple(as_list(cfg.get("printable_area"))), tuple(as_list(cfg.get("bed_exclude_area"))))
+    if key in _PURGE_CACHE:
+        return _PURGE_CACHE[key]
+    nozzle = to_float(nozzles[0]) if nozzles else 0.4
+    mvs = 2.0 if nozzle is not None and nozzle <= 0.25 else 15.0
+    out = []
+    usable = rsg.usable_bed(cfg)
+    extruders = (0, 1) if len(nozzles) > 1 else (0,)
+    for label, fp, room in purge_footprints(usable):
+        for ie in extruders:
+            for sample_mvs in ((mvs, 0.0) if label == "centre" else (mvs,)):
+                probs = check_purge_render(text, cfg, fp, ie, sample_mvs, room)
+                if probs:
+                    out.append(("SM2-GC-PURGE", "%s (T%d, MVS %g): %s" % (label, ie, sample_mvs, probs[0])))
+                    break
+            if out:
+                break
+        if out:
+            break
+    _PURGE_CACHE[key] = out
+    return out
 
 
 def drift_normalise(text):
@@ -615,6 +754,7 @@ def check_sm2_rules(presets, resolve, machines_inst, sm2_scope, report):
             emit(rule_gc_mcode(text) + rule_gc_bedtype(text), where)
             if key == "machine_start_gcode":
                 emit(rule_gc_hotbed(text) + rule_gc_flush(text, single), where)
+                emit([(r, "%s: %s" % (name, msg)) for r, msg in rule_gc_purge(text, cfg)], where)
             if key == "change_filament_gcode":
                 emit(rule_gc_bedmin(text), where)
         # outside the GCODE_KEYS loop: that loop skips empty values, and a missing pause G-code is the bug

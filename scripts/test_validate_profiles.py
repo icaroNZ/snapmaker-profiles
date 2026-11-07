@@ -8,7 +8,8 @@ Run:  python3 -I scripts/test_validate_profiles.py [-v]
   regression re-applied per test (must FAIL with the matching rule ID), so every fix in the
   a250t fix pass stays covered.
 * A line-ending test guards the CRLF preset files against accidental LF conversion.
-* Renderer tests pin the Orca PlaceholderParser semantics that render_start_gcode.py mirrors.
+* Renderer tests pin the Orca PlaceholderParser semantics that render_start_gcode.py mirrors, and purge
+  tests render the SM2 start G-code for concrete footprints (PR-09).
 """
 
 import glob
@@ -151,6 +152,72 @@ class RendererTests(unittest.TestCase):
                 self.assertNotIn("{", text, (base, key))
 
 
+class PurgeTests(unittest.TestCase):
+    """PR-09: footprint-, nozzle- and MVS-aware purge in the four SM2 start templates."""
+
+    def render(self, printer, footprint, ie=0, mvs=15.0):
+        cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), printer)
+        text, local = rsg.render(cfg["machine_start_gcode"], rsg.sample_variables(cfg, footprint, ie, mvs), ie)
+        purge = [m["line"] for m in rsg.gcode_moves(text) if m["line"].startswith(("G0 X", "G1 X"))
+                 and "X10 F" not in m["line"]]
+        return text, local, purge
+
+    def test_centre_part_purges_in_front(self):
+        text, local, purge = self.render("Snapmaker A250 (0.4 nozzle)", (90, 100, 140, 150))
+        self.assertIn("; SM2_PURGE front start X90.00 Y85.00 len 100", text)
+        self.assertEqual((local["sm2_purge_x"], local["sm2_purge_y"]), (90.0, 85.0))
+        self.assertEqual(purge, ["G0 X90.00 Y85.00 F3420.0", "G1 X190.00 Y85.00 E6.2363 F3420",
+                                 "G1 X190.00 Y90.00 E0.3118 F200", "G1 X90.00 Y90.00 E6.2363 F3420",
+                                 "G0 X90.00 Y95.00 F3420.0"])
+
+    def test_corner_parts_purge_beside(self):
+        _, local, purge = self.render("Snapmaker A250 (0.4 nozzle)", (0, 0, 30, 30))
+        self.assertEqual((local["sm2_purge_side"], local["sm2_purge_x"], local["sm2_purge_y"]), ("right", 45.0, 0.0))
+        self.assertEqual(purge[1], "G1 X45.00 Y100.00 E6.2363 F3420")
+        _, local, _ = self.render("Snapmaker A250 (0.4 nozzle)", (200, 0, 230, 30))
+        self.assertEqual((local["sm2_purge_side"], local["sm2_purge_x"]), ("left", 185.0))
+        _, local, _ = self.render("Snapmaker A250 (0.4 nozzle)", (180, 200, 230, 250))  # back-right: front, shifted left
+        self.assertEqual((local["sm2_purge_side"], local["sm2_purge_x"], local["sm2_purge_y"]), ("front", 120.0, 185.0))
+
+    def test_no_room_falls_back_to_old_line(self):
+        _, local, purge = self.render("Snapmaker A250 (0.4 nozzle)", (5, 5, 225, 245))
+        self.assertEqual(local["sm2_purge_side"], "fallback")
+        self.assertEqual(purge, ["G0 X40.00 Y0.00 F3420.0", "G1 X220.00 Y0.00 E11.2253 F3420",
+                                 "G1 X220.00 Y10.00 E0.6236 F200", "G1 X40.00 Y10.00 E11.2253 F3420",
+                                 "G0 X40.00 Y20.00 F3420.0"])
+
+    def test_nozzle_and_mvs_scale_the_purge(self):
+        text, _, purge = self.render("Snapmaker A250 (0.2 nozzle)", (90, 100, 140, 150), mvs=2.0)
+        self.assertIn("G1 X190.00 Y85.00 E3.1181 F1600", purge)  # width 0.25, 2 mm3/s / (0.25 x 0.3) = 26.7 mm/s
+        self.assertIn("G1 E3 F49.9", text)                         # stationary primes capped by MVS too
+        self.assertIn("G1 E4 F49.9", text)
+        _, _, purge = self.render("Snapmaker A250 (0.8 nozzle)", (90, 100, 140, 150), mvs=0.0)
+        self.assertIn("G1 X190.00 Y85.00 E12.4726 F3420", purge)   # MVS 0 = unset: old 3420 feed
+
+    def test_dual_uses_the_initial_tool(self):
+        _, local, purge = self.render("Snapmaker A250 Dual (0.4 nozzle)", (90, 100, 140, 150), ie=1, mvs=[15.0, 2.0])
+        self.assertIn("G1 X190.00 Y85.00 E6.2363 F800", purge)     # T1's filament MVS 2 at width 0.5
+        self.assertEqual(local["sm2_purge_side"], "front")
+
+    def test_twins_share_the_purge_block(self):
+        for a, b in (("fdm_a250.json", "fdm_a350.json"), ("fdm_a250_dual.json", "fdm_a350_dual.json")):
+            pa = [l for l in template(a, "machine_start_gcode").split("\n") if "sm2_" in l or "SM2_PURGE" in l]
+            pb = [l for l in template(b, "machine_start_gcode").split("\n") if "sm2_" in l or "SM2_PURGE" in l]
+            self.assertEqual(pa, pb)
+            self.assertGreater(len(pa), 10)
+
+    def test_rule_passes_on_every_base(self):
+        for printer in ("Snapmaker A250 (0.4 nozzle)", "Snapmaker A250 Dual QS+B Kit (0.2 nozzle)",
+                        "Snapmaker A350 QSKit (0.8 nozzle)"):
+            cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), printer)
+            self.assertEqual(vp.rule_gc_purge(cfg["machine_start_gcode"], cfg), [], printer)
+
+    def test_rule_catches_fixed_purge(self):
+        cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), "Snapmaker A250 (0.4 nozzle)")
+        old = "G0 X40 F3420.0\nG0 Z0.3 F960.0\nG1 X220 E12 F3420.0\n"
+        self.assertEqual([r for r, _ in vp.rule_gc_purge(old, cfg)], ["SM2-GC-PURGE"])
+
+
 class FixedTemplateTests(unittest.TestCase):
     """The shipped A250/A350 templates themselves (fix pass items SP-01, SP-03, #552, SP-06)."""
 
@@ -234,8 +301,28 @@ class BundleTests(unittest.TestCase):
                       "SM2-GC-BEDMIN")
 
     def test_drift_regression(self):
-        self._mutated("machine/fdm_a350_dual.json", b"G1 X40 E12 F3420.0", b"G1 X40 E6.264 F3420.0",
+        self._mutated("machine/fdm_a350_dual.json", b"G1 E4 F{digits(min(80.0", b"G1 E6 F{digits(min(80.0",
                       "SM2-GC-DRIFT")
+
+    def test_pr09_purge_placeholder_regression(self):
+        self._mutated("machine/fdm_a250.json", b"local sm2_mvs = filament_max_volumetric_speed[initial_extruder]",
+                      b"local sm2_mvs = 15.0", "SM2-GC-PURGE")
+
+    def test_pr09_purge_off_bed_regression(self):
+        self._mutated("machine/fdm_a250_dual.json", b"local sm2_bx0 = print_bed_min[0] + 10.0",
+                      b"local sm2_bx0 = print_bed_min[0] - 30.0", "SM2-GC-PURGE")
+
+    def test_pr09_purge_clearance_regression(self):
+        self._mutated("machine/fdm_a350.json", b"local sm2_purge_off = 15.0", b"local sm2_purge_off = 3.0",
+                      "SM2-GC-PURGE")
+
+    def test_pr09_purge_flow_regression(self):
+        self._mutated("machine/fdm_a350_dual.json", b"min(3420.0, 60.0 * sm2_mvs", b"max(3420.0, 60.0 * sm2_mvs",
+                      "SM2-GC-PURGE")
+
+    def test_pr09_purge_parse_error_regression(self):
+        self._mutated("machine/fdm_a250.json", b"local sm2_purge_ex = sm2_purge_x + (",
+                      b"local sm2_purge_ex = (sm2_purge_x) + (", "SM2-GC-PURGE")
 
     def test_pr01_pause_empty_regression(self):
         self._mutated("machine/fdm_a250.json", b'"machine_pause_gcode": "M600"', b'"machine_pause_gcode": ""',
