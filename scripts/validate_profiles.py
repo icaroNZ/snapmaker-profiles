@@ -35,6 +35,9 @@ on) when it loads ``Snapmaker.json`` in ``PresetBundle::load_vendor_configs_from
   SM2-GC-FLUSH  start flush temperature is capped at nozzle_temperature_range_high
                 (and 275 on single-head printers)
   SM2-GC-BEDMIN change_filament_gcode never lowers the bed with min() (Orca #552)
+  SM2-GC-PAUSE  machine_pause_gcode resolves to a template with an M600 line (Orca's
+                "Pause" item writes only this key after ;PAUSE_PRINT; an empty value
+                means the print never stops; M600 is the controller's runout pause)
 
 Findings that involve the Snapmaker 2.0 A250/A350 presets (directly, or as a
 base of them) are ERRORs and make the script exit with status 1. Findings on
@@ -95,7 +98,8 @@ GCODE_KEYS = ("machine_start_gcode", "machine_end_gcode", "change_filament_gcode
               "layer_change_gcode", "machine_pause_gcode", "pause_gcode", "template_custom_gcode",
               "time_lapse_gcode", "wrapping_detection_gcode")
 SM2_TWINS = (("fdm_a250", "fdm_a350"), ("fdm_a250_dual", "fdm_a350_dual"))
-DRIFT_KEYS = ("machine_start_gcode", "machine_end_gcode", "change_filament_gcode", "before_layer_change_gcode")
+DRIFT_KEYS = ("machine_start_gcode", "machine_end_gcode", "change_filament_gcode", "before_layer_change_gcode",
+              "machine_pause_gcode")
 SM2_PRINTER_RE = re.compile(r"^Snapmaker (A250|A350)( Dual)?( QSKit| BKit| QS\+B Kit)? \((\d+(?:\.\d+)?) nozzle\)$")
 
 
@@ -251,6 +255,21 @@ def rule_gc_bedmin(change):
     if re.search(r"M140\s+S\{\s*min\(", str(change or "")):
         return [("SM2-GC-BEDMIN", "change_filament_gcode lowers the bed with M140 S{min(...)}: Orca already set the"
                                   " max over all used filaments, nothing raises it again (Orca #552)")]
+    return []
+
+
+def rule_gc_pause(text):
+    """SM2-GC-PAUSE: Orca's "Pause" item writes only machine_pause_gcode after ;PAUSE_PRINT (Orca GCode.cpp:5011-5018;
+    the legacy key pause_gcode is unknown to Orca and dropped on load). On the SM2 controller (no
+    ADVANCED_PAUSE_FEATURE) M600 arms the filament-runout pause: Snapmaker2-Controller
+    Marlin/src/gcode/feature/pause/M600.cpp:163-174."""
+    lines = gcode_code_lines(text)
+    if not lines:
+        return [("SM2-GC-PAUSE", "is missing or empty (comments only): Orca's Pause at layer"
+                                 " writes only a ;PAUSE_PRINT comment and the print does not stop; use M600")]
+    if not any(re.match(r"M600\b", code) for code in lines):
+        return [("SM2-GC-PAUSE", "%r has no M600 line; M600 is the G-code that triggers the SM2's"
+                                 " screen pause/runout flow (M600.cpp:163-174)" % "\n".join(lines)[:60])]
     return []
 
 
@@ -598,6 +617,9 @@ def check_sm2_rules(presets, resolve, machines_inst, sm2_scope, report):
                 emit(rule_gc_hotbed(text) + rule_gc_flush(text, single), where)
             if key == "change_filament_gcode":
                 emit(rule_gc_bedmin(text), where)
+        # outside the GCODE_KEYS loop: that loop skips empty values, and a missing pause G-code is the bug
+        emit(rule_gc_pause(cfg.get("machine_pause_gcode")),
+             "%s:machine_pause_gcode" % defined_in("machine", chain, "machine_pause_gcode"))
         for ptype, key in (("filament", "default_filament_profile"), ("process", "default_print_profile")):
             for dflt in as_list(cfg.get(key)):
                 if not dflt or ("process" if ptype == "process" else "filament", dflt) not in presets:

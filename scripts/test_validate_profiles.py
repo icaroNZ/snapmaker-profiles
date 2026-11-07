@@ -88,6 +88,12 @@ class RuleUnitTests(unittest.TestCase):
         self.assertEqual([r for r, _ in vp.rule_gc_drift("a", a, "b", b.replace("E12", "E6.264"), "k")],
                          ["SM2-GC-DRIFT"])
 
+    def test_pause_rule(self):
+        for bad in (None, "", "  \n", "; M600 in a comment only", ";PAUSE_PRINT", "M0", "G4 S10\nM117 Pause"):
+            self.assertEqual([r for r, _ in vp.rule_gc_pause(bad)], ["SM2-GC-PAUSE"], repr(bad))
+        for good in ("M600", "M600 ;pause print", "M117 Pause\n  M600\n", "M600 T0"):
+            self.assertEqual(vp.rule_gc_pause(good), [], repr(good))
+
     def test_temp_max(self):
         single = ["Snapmaker A250 (0.4 nozzle)"]
         dual = ["Snapmaker A250 Dual (0.4 nozzle)"]
@@ -116,6 +122,12 @@ class FixedTemplateTests(unittest.TestCase):
             self.assertEqual(vp.rule_gc_flush(start, single="dual" not in base), [], base)
             self.assertIn("G92 Z1.6", start, base)
             self.assertIn("SM2_HOTBED_COMP", start, base)
+
+    def test_pause_gcode(self):
+        """PR-01: Orca's Pause at layer writes machine_pause_gcode; M600 is the SM2 runout pause (single and Dual)."""
+        for base in self.BASES:
+            self.assertEqual(template(base, "machine_pause_gcode"), "M600", base)
+            self.assertEqual(vp.rule_gc_pause(template(base, "machine_pause_gcode")), [], base)
 
     def test_dual_toolchange(self):
         for base in ("fdm_a250_dual.json", "fdm_a350_dual.json"):
@@ -182,6 +194,18 @@ class BundleTests(unittest.TestCase):
 
     def test_drift_regression(self):
         self._mutated("machine/fdm_a350_dual.json", b"G1 X40 E12 F3420.0", b"G1 X40 E6.264 F3420.0",
+                      "SM2-GC-DRIFT")
+
+    def test_pr01_pause_empty_regression(self):
+        self._mutated("machine/fdm_a250.json", b'"machine_pause_gcode": "M600"', b'"machine_pause_gcode": ""',
+                      "SM2-GC-PAUSE")
+
+    def test_pr01_pause_missing_regression(self):
+        # Dual base without the key: it then resolves to nothing (fdm_linear2_dual/fdm_linear2/fdm_common lack it)
+        self._mutated("machine/fdm_a250_dual.json", b'  "machine_pause_gcode": "M600",\r\n', b"", "SM2-GC-PAUSE")
+
+    def test_pr01_pause_drift_regression(self):
+        self._mutated("machine/fdm_a350.json", b'"machine_pause_gcode": "M600"', b'"machine_pause_gcode": "M600\\nM0"',
                       "SM2-GC-DRIFT")
 
     def test_sp01_hotbed_regression(self):
