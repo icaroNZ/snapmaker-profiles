@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Render Snapmaker Orca custom G-code templates offline (subset of Orca's PlaceholderParser).
 
-Used by validate_profiles.py (rules SM2-GC-PURGE and SM2-GC-PARK) and its tests to check the SM2 start
+Used by validate_profiles.py (rules SM2-GC-PURGE, SM2-GC-PARK and SM2-GC-MESH) and its tests to check the SM2 start
 G-code for concrete first-layer footprints, and usable on its own:
 
     python3 -I scripts/render_start_gcode.py "Snapmaker A250 (0.4 nozzle)" --footprint 90,100,140,150
     python3 -I scripts/render_start_gcode.py "Snapmaker A250 Dual (0.4 nozzle)" --footprint 0,0,30,30 --extruder 1 --moves
+    python3 -I scripts/render_start_gcode.py "Snapmaker A250 (0.4 nozzle)" --footprint 0,0,30,30 --adaptive --margin 5 --moves
 
 ``--moves`` prints only the ``; SM2_*`` diagnostic comments (purge side/start, park point, mesh slot) and the
-G0/G1/G28/M109/M190 lines, i.e. where the nozzle parks, waits, drops the flush blob and purges.
+G0/G1/G28/G1029/M109/M190 lines, i.e. where the nozzle parks, waits, drops the flush blob and purges.
+``--adaptive`` appends the opt-in token ``SM2_ADAPTIVE_MESH`` to the preset's ``printer_notes`` (PR-23 adaptive
+mesh); ``--margin`` sets ``adaptive_bed_mesh_margin``.
 
 The semantics follow OrcaSlicer src/libslic3r/PlaceholderParser.cpp (a250t/main):
 * text outside braces is copied verbatim; ``[name]`` is a legacy expansion, and any other ``[`` in
@@ -17,10 +20,12 @@ The semantics follow OrcaSlicer src/libslic3r/PlaceholderParser.cpp (a250t/main)
 * ``{stmt; stmt}`` macros with ``local name = expr`` / ``name = expr`` / expression statements; a
   ``local`` whose right-hand side starts with ``(`` is a vector initialiser in Orca (and a parse error
   when more follows), so it is rejected here;
-* operators ``?: || && == != <> < > <= >= + - * / % ! not and or``; int/int division truncates, int
+* operators ``?: || && == != <> =~ !~ < > <= >= + - * / % ! not and or``; ``s =~ /re/`` is a whole-string
+  boost::regex_match (PlaceholderParser.cpp:657-683, 2075-2076, 2220), done here with re.fullmatch(re.DOTALL)
+  because boost's ``.`` also matches a newline by default (multi-line ``printer_notes``); int/int division truncates, int
   stays int through min/max, out-of-range vector indices read element 0, doubles print like
   ``std::ostream`` (%g, 6 significant digits); ``digits(v, w[, d])``, ``int()``, ``round()``.
-Features the SM2 templates do not use (regex, one_of, interpolate_table, repeat, global, ...) raise
+Features the SM2 templates do not use (one_of, interpolate_table, repeat, global, ...) raise
 RenderError so a template that needs them is noticed instead of silently mis-rendered.
 """
 
@@ -44,8 +49,10 @@ _TOKEN_RE = re.compile(r"""\s*(?:
     (?P<num>\d+\.\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?|\d+[eE][-+]?\d+|\d+)
   | (?P<str>"(?:[^"\\]|\\.)*")
   | (?P<id>[A-Za-z_][A-Za-z0-9_]*)
-  | (?P<op>\|\||&&|==|!=|<>|<=|>=|[-+*/%<>!?:(),;\[\]=])
+  | (?P<op>\|\||&&|==|!=|<>|=~|!~|<=|>=|[-+*/%<>!?:(),;\[\]=])
 )""", re.X)
+# Orca: regular_expression = raw[lexeme['/' > *((utf8char - '\\' - '/') | ('\\' > char_)) > '/']] (only after =~ / !~)
+_REGEX_RE = re.compile(r"\s*/((?:[^\\/]|\\.)*)/")
 
 
 def _tokenize(src):
@@ -53,6 +60,13 @@ def _tokenize(src):
     while pos < len(src):
         if src[pos:].strip() == "":
             break
+        if toks and toks[-1] in (("op", "=~"), ("op", "!~")):
+            m = _REGEX_RE.match(src, pos)
+            if not m:
+                raise RenderError("Expecting a regular expression after %s at %r" % (toks[-1][1], src[pos:pos + 20]))
+            toks.append(("regex", m.group(1)))
+            pos = m.end()
+            continue
         m = _TOKEN_RE.match(src, pos)
         if not m or m.end() == pos:
             raise RenderError("cannot tokenize macro at %r" % src[pos:pos + 20])
@@ -155,7 +169,17 @@ class _Expr:
         return self._binary(self.equality, ("&&", "and"))
 
     def equality(self):
-        return self._binary(self.relational, ("==", "!=", "<>"))
+        node = self.relational()
+        while True:
+            tok = self.peek()
+            if tok[0] == "op" and tok[1] in ("==", "!=", "<>"):
+                self.i += 1
+                node = ({"<>": "!="}.get(tok[1], tok[1]), node, self.relational())
+            elif tok[0] == "op" and tok[1] in ("=~", "!~"):
+                self.i += 1
+                node = (tok[1], node, ("lit", self.take("regex")[1]))
+            else:
+                return node
 
     def relational(self):
         return self._binary(self.additive, ("<=", ">=", "<", ">"))
@@ -359,6 +383,15 @@ class _Ctx:
             return not v
         if op == "call":
             return self.call(node[1], [self.ev(a) for a in node[2]])
+        if op in ("=~", "!~"):
+            subject = self.ev(node[1])
+            if not isinstance(subject, str):
+                raise RenderError("Left hand side of a regex match must be a string.")
+            try:
+                hit = re.fullmatch(node[2][1], subject, re.S) is not None
+            except re.error as exc:
+                raise RenderError("Regular expression compilation failed: %s" % exc)
+            return hit if op == "=~" else not hit
         a, b = self.ev(node[1]), self.ev(node[2])
         if op in ("||", "&&"):
             if not (isinstance(a, bool) and isinstance(b, bool)):
@@ -514,12 +547,41 @@ def _floats(value, default):
     return out or [default]
 
 
+ADAPTIVE_MESH_TOKEN = "SM2_ADAPTIVE_MESH"  # printer_notes opt-in for the adaptive G1029 line (PR-23)
+
+
+def _point(value, default):
+    """Orca coPoint as stored in presets ("x,y", "XxY" or [x, y]) -> (x, y)."""
+    if isinstance(value, list) and len(value) == 2:
+        value = "%s,%s" % tuple(value)
+    m = re.match(r"\s*(-?[\d.]+)\s*[,x]\s*(-?[\d.]+)\s*$", str(value)) if value is not None else None
+    return (float(m.group(1)), float(m.group(2))) if m else default
+
+
+def adaptive_mesh_bounds(printer_cfg, footprint, margin=None):
+    """Orca's adaptive_bed_mesh_min/max (GCode.cpp:3069-3072): first-layer bbox -/+ adaptive_bed_mesh_margin,
+    limited to bed_mesh_min/max (PrintConfig.cpp:1881-1919 defaults -99999 / 99999, i.e. no limit)."""
+    if margin is None:
+        margin = _floats(printer_cfg.get("adaptive_bed_mesh_margin"), 0.0)[0]
+    lo = _point(printer_cfg.get("bed_mesh_min"), (-99999.0, -99999.0))
+    hi = _point(printer_cfg.get("bed_mesh_max"), (99999.0, 99999.0))
+    fx0, fy0, fx1, fy1 = (float(v) for v in footprint)
+    return ([max(lo[0], fx0 - margin), max(lo[1], fy0 - margin)],
+            [min(hi[0], fx1 + margin), min(hi[1], fy1 + margin)])
+
+
 def sample_variables(printer_cfg, footprint, initial_extruder=0, mvs=15.0, filament_diameter=1.75,
-                     bed_temp=60, nozzle_temp=210, ooze_prevention=False):
+                     bed_temp=60, nozzle_temp=210, ooze_prevention=False, adaptive=False, margin=None,
+                     printer_notes=None):
     """Placeholder values for the SM2 start G-code: geometry from the machine preset, filament values sampled.
 
-    footprint = (x0, y0, x1, y1) of the first layer in bed coordinates (Orca first_layer_print_min/max)."""
+    footprint = (x0, y0, x1, y1) of the first layer in bed coordinates (Orca first_layer_print_min/max).
+    printer_notes defaults to the preset's; adaptive=True appends the SM2_ADAPTIVE_MESH opt-in line to it."""
     bed, _ = bed_geometry(printer_cfg)
+    notes = str(printer_cfg.get("printer_notes", "") if printer_notes is None else printer_notes)
+    if adaptive:
+        notes += ("" if notes.endswith("\n") or not notes else "\n") + ADAPTIVE_MESH_TOKEN + "\n"
+    mesh_min, mesh_max = adaptive_mesh_bounds(printer_cfg, footprint, margin)
     nozzles = _floats(printer_cfg.get("nozzle_diameter"), 0.4)
     n = max(2, len(nozzles))
     mvs_list = mvs if isinstance(mvs, list) else [mvs] * n
@@ -539,6 +601,7 @@ def sample_variables(printer_cfg, footprint, initial_extruder=0, mvs=15.0, filam
         "print_bed_min": [bed[0], bed[1]], "print_bed_max": [bed[2], bed[3]],
         "print_bed_size": [bed[2] - bed[0], bed[3] - bed[1]],
         "max_layer_z": 20.0, "printable_height": float(_floats(printer_cfg.get("printable_height"), 230.0)[0]),
+        "printer_notes": notes, "adaptive_bed_mesh_min": mesh_min, "adaptive_bed_mesh_max": mesh_max,
     }
 
 
@@ -594,13 +657,17 @@ def main(argv=None):
     ap.add_argument("--mvs", type=float, default=15.0, help="filament_max_volumetric_speed (mm^3/s)")
     ap.add_argument("--key", default="machine_start_gcode")
     ap.add_argument("--moves", action="store_true",
-                    help="print only the '; SM2_*' comments and the G0/G1/G28/M109/M190 lines")
+                    help="print only the '; SM2_*' comments and the G0/G1/G28/G1029/M109/M190 lines")
+    ap.add_argument("--adaptive", action="store_true",
+                    help="append the opt-in token %s to printer_notes (adaptive G1029 mesh, PR-23)" % ADAPTIVE_MESH_TOKEN)
+    ap.add_argument("--margin", type=float, default=None, help="adaptive_bed_mesh_margin (mm), default: preset or 0")
     args = ap.parse_args(argv)
     cfg = resolve_machine(load_machine_presets(args.root), args.printer)
     fp = tuple(float(v) for v in args.footprint.split(","))
-    text, local = render(cfg.get(args.key, ""), sample_variables(cfg, fp, args.extruder, args.mvs), args.extruder)
+    variables = sample_variables(cfg, fp, args.extruder, args.mvs, adaptive=args.adaptive, margin=args.margin)
+    text, local = render(cfg.get(args.key, ""), variables, args.extruder)
     if args.moves:
-        keep = re.compile(r"^(; SM2_(PURGE|PARK|MESH) |G[01] |G28\b|M1(09|90) )")
+        keep = re.compile(r"^(; SM2_(PURGE|PARK|MESH|MESH_ADAPTIVE) |G[01] |G28\b|G1029 |M1(09|90) )")
         text = "\n".join(l for l in text.split("\n") if keep.match(l) and " plan" not in l[:16])
     sys.stdout.write(text + "\n")
     return 0

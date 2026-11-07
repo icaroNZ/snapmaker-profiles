@@ -48,6 +48,13 @@ on) when it loads ``Snapmaker.json`` in ``PresetBundle::load_vendor_configs_from
                 bed_exclude_area, at least as far from the footprint as the purge start (>= 10 mm unless fallback),
                 >= 8 mm from every purge extrusion (the nozzle never lands on the blob) and <= 15 mm from the purge
                 line (fallback: the old X10 Y0 corner)
+  SM2-GC-MESH   adaptive bed mesh (PR-23) is opt-in: rendered for the same footprints (adaptive_bed_mesh_margin 0
+                and 5 mm), the start G-code emits no G1029 unless printer_notes contains SM2_ADAPTIVE_MESH (stock and
+                pre-a250t.8 firmware ignore L/R/F/B and probe the whole grid, leaving it for the card step); with the
+                token a single-head printer emits exactly one 'G1029 A L.. R.. F.. B..' (no H/K/P) after G28 and
+                M190 R and before every G0/G1, whose region is Orca's adaptive_bed_mesh_min/max clamped to the bed,
+                and nothing else changes; Dual printers emit no G1029 (the controller refuses G1029 A without the
+                single 3DP head, G1029.cpp:337-340)
 
 Findings that involve the Snapmaker 2.0 A250/A350 presets (directly, or as a
 base of them) are ERRORs and make the script exit with status 1. Findings on
@@ -125,6 +132,10 @@ PARK_X_MARGIN = 10.0          # mm inside the bed in X, as the purge (A250/A350 
 PARK_CLEARANCE = 10.0         # mm between the blob point and the footprint (template: purge 15 mm + 10 mm)
 PARK_SEPARATION = 8.0         # mm between the blob point and any purge extrusion (template: 10 mm)
 PARK_NEAR = 15.0              # mm: the blob point is beside the purge line (template: <= 14.2 mm)
+# SM2-GC-MESH (PR-23): opt-in token in printer_notes, the line it enables, sampled margins.
+MESH_TOKEN = "SM2_ADAPTIVE_MESH"
+MESH_LINE_RE = re.compile(r"^G1029 A L(-?\d+\.\d+) R(-?\d+\.\d+) F(-?\d+\.\d+) B(-?\d+\.\d+)$")
+MESH_MARGINS = (0.0, 5.0)     # adaptive_bed_mesh_margin samples; 5 mm pushes the corner footprints past the bed edge
 SM2_PRINTER_RE = re.compile(r"^Snapmaker (A250|A350)( Dual)?( QSKit| BKit| QS\+B Kit)? \((\d+(?:\.\d+)?) nozzle\)$")
 
 
@@ -480,6 +491,83 @@ def rule_gc_park(start, cfg):
             probs = check_park_render(text, cfg, fp, ie, mvs)
             if probs:
                 out.append(("SM2-GC-PARK", "%s (T%d): %s" % (label, ie, probs[0])))
+                break
+        if out:
+            break
+    _PURGE_CACHE[key] = out
+    return out
+
+
+def check_mesh_render(start, cfg, footprint, initial_extruder, margin, dual):
+    """SM2-GC-MESH for one footprint: render without and with the printer_notes opt-in; return problems."""
+    rsg = renderer()
+    bed, _ = rsg.bed_geometry(cfg)
+    try:
+        off, _ = rsg.render(start, rsg.sample_variables(cfg, footprint, initial_extruder, margin=margin),
+                            initial_extruder)
+        on, _ = rsg.render(start, rsg.sample_variables(cfg, footprint, initial_extruder, margin=margin, adaptive=True),
+                           initial_extruder)
+    except rsg.RenderError as exc:
+        return ["does not render: %s" % exc]
+    off_l, on_l = gcode_code_lines(off), gcode_code_lines(on)
+    is_g1029 = lambda c: re.match(r"G1029\b", c) is not None
+    if any(is_g1029(c) for c in off_l):
+        return ["emits %r without %s in printer_notes: the adaptive line must be opt-in (stock and pre-a250t.8"
+                " firmware ignore L/R/F/B, probe the whole grid and leave it for the card step)"
+                % (next(c for c in off_l if is_g1029(c)), MESH_TOKEN)]
+    hits = [k for k, c in enumerate(on_l) if is_g1029(c)]
+    if dual:
+        if hits:
+            return ["emits %r with %s on a Dual printer: the controller refuses G1029 A without the single 3DP head"
+                    " (G1029.cpp:337-340)" % (on_l[hits[0]], MESH_TOKEN)]
+        return [] if on_l == off_l else ["%s changes the Dual start G-code" % MESH_TOKEN]
+    if len(hits) != 1:
+        return ["with %s in printer_notes: %d G1029 lines, want exactly one 'G1029 A L.. R.. F.. B..'"
+                % (MESH_TOKEN, len(hits))]
+    k = hits[0]
+    line, problems = on_l[k], []
+    if on_l[:k] + on_l[k + 1:] != off_l:
+        problems.append("%s changes more than the G1029 line (the rest of the start G-code must stay as without it)"
+                        % MESH_TOKEN)
+    m = MESH_LINE_RE.match(line)
+    if not m:
+        problems.append("%r is not 'G1029 A L<x0> R<x1> F<y0> B<y1>' (no H/K: the bed is already at temperature from"
+                        " M190 R and H would undo the touchscreen's bed-temperature override; P is ignored)" % line)
+    else:
+        l, r, f, b = (float(v) for v in m.groups())
+        lo, hi = rsg.adaptive_mesh_bounds(cfg, footprint, margin)
+        want = (max(bed[0], min(bed[2], lo[0])), max(bed[0], min(bed[2], hi[0])),
+                max(bed[1], min(bed[3], lo[1])), max(bed[1], min(bed[3], hi[1])))
+        if not (bed[0] - 1e-6 <= l <= r <= bed[2] + 1e-6 and bed[1] - 1e-6 <= f <= b <= bed[3] + 1e-6):
+            problems.append("%r: region outside the bed %s or inverted" % (line, bed))
+        elif any(abs(a - w) > 0.006 for a, w in zip((l, r, f, b), want)):
+            problems.append("%r: region is not adaptive_bed_mesh_min/max (first layer %s +- margin %g) clamped to the"
+                            " bed, want L%.2f R%.2f F%.2f B%.2f" % ((line, footprint, margin) + want))
+    first = lambda pat: next((i for i, c in enumerate(on_l) if re.match(pat, c)), None)
+    g28, m190, move = first(r"G28\b"), first(r"M190\s+R"), first(r"G[01]\b")
+    if g28 is None or m190 is None or not (g28 < m190 < k) or (move is not None and move < k):
+        problems.append("%r must come after G28 and M190 R and before the first G0/G1 (park move): G28 at %s, M190 R"
+                        " at %s, G1029 at %d, first move at %s" % (line, g28, m190, k, move))
+    return problems
+
+
+def rule_gc_mesh(start, cfg, dual):
+    """SM2-GC-MESH (PR-23) for one resolved SM2 printer preset."""
+    text = str(start or "")
+    key = ("mesh", text, dual, str(cfg.get("printer_notes", "")), tuple(as_list(cfg.get("printable_area"))),
+           tuple(as_list(cfg.get("bed_exclude_area"))), tuple(as_list(cfg.get("nozzle_diameter"))),
+           str(cfg.get("adaptive_bed_mesh_margin")), str(cfg.get("bed_mesh_min")), str(cfg.get("bed_mesh_max")))
+    if key in _PURGE_CACHE:
+        return _PURGE_CACHE[key]
+    out = []
+    for label, fp, _room in purge_footprints(renderer().usable_bed(cfg)):
+        for margin in MESH_MARGINS:
+            for ie in ((0, 1) if dual else (0,)):
+                probs = check_mesh_render(text, cfg, fp, ie, margin, dual)
+                if probs:
+                    out.append(("SM2-GC-MESH", "%s (T%d, margin %g): %s" % (label, ie, margin, probs[0])))
+                    break
+            if out:
                 break
         if out:
             break
@@ -863,6 +951,7 @@ def check_sm2_rules(presets, resolve, machines_inst, sm2_scope, report):
                 emit(rule_gc_hotbed(text) + rule_gc_flush(text, single), where)
                 emit([(r, "%s: %s" % (name, msg)) for r, msg in rule_gc_purge(text, cfg)], where)
                 emit([(r, "%s: %s" % (name, msg)) for r, msg in rule_gc_park(text, cfg)], where)
+                emit([(r, "%s: %s" % (name, msg)) for r, msg in rule_gc_mesh(text, cfg, dual=not single)], where)
             if key == "change_filament_gcode":
                 emit(rule_gc_bedmin(text), where)
         # outside the GCODE_KEYS loop: that loop skips empty values, and a missing pause G-code is the bug

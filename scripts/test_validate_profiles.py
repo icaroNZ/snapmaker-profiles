@@ -10,7 +10,7 @@ Run:  python3 -I scripts/test_validate_profiles.py [-v]
 * A line-ending test guards the CRLF preset files against accidental LF conversion.
 * Renderer tests pin the Orca PlaceholderParser semantics that render_start_gcode.py mirrors, and purge
   tests render the SM2 start G-code for concrete footprints (PR-09); park tests pin the flush/blob point
-  that follows the purge start (smart park).
+  that follows the purge start (smart park); mesh tests pin the opt-in adaptive G1029 line (PR-23).
 """
 
 import glob
@@ -144,6 +144,18 @@ class RendererTests(unittest.TestCase):
             self.r("{local nozzle_diameter = 1}", nozzle_diameter=[0.4])  # read-only system symbol
         with self.assertRaises(rsg.RenderError):
             self.r("{if 1}x{endif}")  # not a boolean
+
+    def test_regex_match(self):
+        """Orca '=~' / '!~': whole-string boost::regex_match, '.' spans newlines (PlaceholderParser.cpp:657-683)."""
+        tpl = "{if printer_notes=~/.*SM2_ADAPTIVE_MESH.*/}on{else}off{endif}"
+        self.assertEqual(self.r(tpl, printer_notes="PRINTER_MODEL_SNAPMAKER_A250\nSM2_ADAPTIVE_MESH\n"), "on")
+        self.assertEqual(self.r(tpl, printer_notes="PRINTER_MODEL_SNAPMAKER_A250\n"), "off")
+        self.assertEqual(self.r(tpl, printer_notes=""), "off")
+        self.assertEqual(self.r("{if s=~/A250/}y{else}n{endif}", s="A250 Dual"), "n")  # anchored: no partial match
+        self.assertEqual(self.r("{if s!~/.*a\\/b.*/ and 2 > 1}y{else}n{endif}", s="x a/b"), "n")  # escaped '/'
+        self.assertEqual(self.r("{8/2}"), "4")  # '/' outside a regex is still division
+        with self.assertRaises(rsg.RenderError):
+            self.r("{if n=~/x/}y{endif}", n=1)  # Orca: left hand side of a regex match must be a string
 
     def test_current_templates_render(self):
         for base in FixedTemplateTests.BASES:
@@ -298,6 +310,98 @@ class ParkTests(unittest.TestCase):
         self.assertIn("SM2_PARK point", found[0][1])
 
 
+class MeshTests(unittest.TestCase):
+    """PR-23: opt-in adaptive G1029 region probe after M190 R (controller SM2-5.2.1-a250t.8 and later)."""
+
+    def render(self, printer, footprint, adaptive, ie=0, margin=None, notes=None):
+        cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), printer)
+        var = rsg.sample_variables(cfg, footprint, ie, adaptive=adaptive, margin=margin, printer_notes=notes)
+        return rsg.render(cfg["machine_start_gcode"], var, ie)[0]
+
+    @staticmethod
+    def g1029(text):
+        return [l for l in text.split("\n") if l.startswith("G1029")]
+
+    def test_off_by_default_and_output_unchanged(self):
+        """Without the token the start G-code is byte-identical to the template with the {if} block removed."""
+        import re
+        for base in ("fdm_a250.json", "fdm_a350.json"):
+            start = template(base, "machine_start_gcode")
+            block = re.findall(r"\{if printer_notes=~/\.\*SM2_ADAPTIVE_MESH\.\*/\}.*?\{endif\}", start, re.S)
+            self.assertEqual(len(block), 1, base)
+            stripped = start.replace(block[0], "")
+            cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), "Snapmaker %s (0.4 nozzle)" % base[4:8].upper())
+            for _, fp, _ in vp.purge_footprints(rsg.usable_bed(cfg)):
+                var = rsg.sample_variables(cfg, fp)
+                self.assertNotIn(rsg.ADAPTIVE_MESH_TOKEN, var["printer_notes"])
+                off = rsg.render(start, var)[0]
+                self.assertEqual(off, rsg.render(stripped, var)[0], (base, fp))
+                self.assertEqual(self.g1029(off), [], (base, fp))
+
+    def test_exact_lines(self):
+        cases = [  # (printer, footprint, margin, expected line)
+            ("Snapmaker A250 (0.4 nozzle)", (90, 100, 140, 150), None, "G1029 A L90.00 R140.00 F100.00 B150.00"),
+            ("Snapmaker A250 (0.4 nozzle)", (0, 0, 30, 30), 5, "G1029 A L0.00 R35.00 F0.00 B35.00"),  # bed clamp
+            ("Snapmaker A250 QSKit (0.8 nozzle)", (195.5, 5.25, 225.75, 35), 2, "G1029 A L193.50 R227.75 F3.25 B37.00"),
+            ("Snapmaker A350 (0.4 nozzle)", (300, 320, 320, 350), 10, "G1029 A L290.00 R320.00 F310.00 B350.00"),
+        ]
+        for printer, fp, margin, want in cases:
+            self.assertEqual(self.g1029(self.render(printer, fp, True, margin=margin)), [want], (printer, fp))
+
+    def test_position_after_bed_wait_before_park(self):
+        for printer in ("Snapmaker A250 (0.4 nozzle)", "Snapmaker A350 BKit (0.6 nozzle)"):
+            lines = self.render(printer, (90, 100, 140, 150), True).split("\n")
+            k = next(i for i, l in enumerate(lines) if l.startswith("G1029 A "))
+            self.assertTrue(lines[k - 2].startswith("; SM2_MESH saved bed mesh"), lines[k - 2])
+            self.assertTrue(lines[k - 1].startswith("; SM2_MESH_ADAPTIVE on"), lines[k - 1])
+            self.assertTrue(lines[k - 3].startswith("M190 R"), lines[k - 3])
+            first_move = next(i for i, l in enumerate(lines) if l.startswith(("G0 ", "G1 ")))
+            self.assertLess(k, first_move)
+            self.assertTrue(lines[first_move].startswith("G0 X"), lines[first_move])  # park move unchanged
+
+    def test_opt_in_only_adds_the_mesh_lines(self):
+        for printer in ("Snapmaker A250 (0.4 nozzle)", "Snapmaker A350 QS+B Kit (0.4 nozzle)"):
+            for fp in ((0, 0, 30, 30), (90, 100, 140, 150), (5, 5, 225, 205)):
+                off = self.render(printer, fp, False).split("\n")
+                on = [l for l in self.render(printer, fp, True).split("\n")
+                      if not l.startswith(("G1029 A ", "; SM2_MESH_ADAPTIVE "))]
+                self.assertEqual(on, off, (printer, fp))
+
+    def test_token_anywhere_in_multiline_notes(self):
+        notes = "PRINTER_MODEL_SNAPMAKER_A250\nPRINTER_MODEL_SNAPMAKER_A250_QUICKSWAPKIT\nmy notes SM2_ADAPTIVE_MESH here\n"
+        self.assertEqual(len(self.g1029(self.render("Snapmaker A250 (0.4 nozzle)", (90, 100, 140, 150), False,
+                                                    notes=notes))), 1)
+        self.assertEqual(self.g1029(self.render("Snapmaker A250 (0.4 nozzle)", (90, 100, 140, 150), False,
+                                                notes="sm2_adaptive_mesh\n")), [])  # case-sensitive, as Orca
+
+    def test_dual_never_probes(self):
+        """The controller refuses G1029 A for the dual extruder (G1029.cpp:337-340), so the Dual bases have no line."""
+        for base in ("fdm_a250_dual.json", "fdm_a350_dual.json"):
+            code = vp.gcode_code_lines(template(base, "machine_start_gcode"))
+            self.assertEqual([c for c in code if "G1029" in c or "SM2_ADAPTIVE_MESH" in c], [], base)
+        for ie in (0, 1):
+            text = self.render("Snapmaker A250 Dual (0.4 nozzle)", (90, 100, 140, 150), True, ie=ie)
+            self.assertEqual(self.g1029(text), [])
+
+    def test_rule_passes_on_every_base(self):
+        for printer in ("Snapmaker A250 (0.4 nozzle)", "Snapmaker A250 QS+B Kit (0.2 nozzle)",
+                        "Snapmaker A350 QSKit (0.8 nozzle)", "Snapmaker A350 Dual (0.4 nozzle)",
+                        "Snapmaker A250 Dual QS+B Kit (0.4 nozzle)"):
+            cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), printer)
+            self.assertEqual(vp.rule_gc_mesh(cfg["machine_start_gcode"], cfg, " Dual" in printer), [], printer)
+
+    def test_rule_catches_unconditional_and_dual(self):
+        cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), "Snapmaker A250 (0.4 nozzle)")
+        start = cfg["machine_start_gcode"]
+        always = start.replace("{if printer_notes=~/.*SM2_ADAPTIVE_MESH.*/}", "{if true}")
+        self.assertNotEqual(always, start)
+        found = vp.rule_gc_mesh(always, cfg, False)
+        self.assertEqual([r for r, _ in found], ["SM2-GC-MESH"])
+        self.assertIn("opt-in", found[0][1])
+        dcfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), "Snapmaker A250 Dual (0.4 nozzle)")
+        self.assertEqual([r for r, _ in vp.rule_gc_mesh(start, dcfg, True)], ["SM2-GC-MESH"])  # single block on Dual
+
+
 class FixedTemplateTests(unittest.TestCase):
     """The shipped A250/A350 templates themselves (fix pass items SP-01, SP-03, #552, SP-06)."""
 
@@ -418,6 +522,34 @@ class BundleTests(unittest.TestCase):
 
     def test_park_no_end_fallback_regression(self):  # clamped blob 5 mm from where the nozzle lands for the purge
         self._mutated("machine/fdm_a350_dual.json", b"sm2_park_d * sm2_park_d - 0.01}", b"0.0 - 1.0}", "SM2-GC-PARK")
+
+    def test_pr23_mesh_always_on_regression(self):  # stock firmware would probe the full grid on every print
+        self._mutated("machine/fdm_a250.json", b"{if printer_notes=~/.*SM2_ADAPTIVE_MESH.*/}", b"{if true}",
+                      "SM2-GC-MESH")
+
+    def test_pr23_mesh_heat_soak_regression(self):  # H would override the screen's bed temperature for the job
+        self._mutated("machine/fdm_a350.json", b"adaptive_bed_mesh_max[1])), 0, 2)}\\n{endif}",
+                      b"adaptive_bed_mesh_max[1])), 0, 2)} H{first_layer_bed_temperature[initial_extruder]}\\n{endif}",
+                      "SM2-GC-MESH")
+
+    def test_pr23_mesh_unclamped_regression(self):
+        self._mutated("machine/fdm_a250.json",
+                      b"L{digits(max(print_bed_min[0], min(print_bed_max[0], adaptive_bed_mesh_min[0])), 0, 2)}",
+                      b"L{digits(adaptive_bed_mesh_min[0], 0, 2)}", "SM2-GC-MESH")
+
+    def test_pr23_mesh_swapped_bound_regression(self):
+        self._mutated("machine/fdm_a350.json", b"min(print_bed_max[1], adaptive_bed_mesh_min[1])), 0, 2)} B",
+                      b"min(print_bed_max[1], adaptive_bed_mesh_max[1])), 0, 2)} B", "SM2-GC-MESH")
+
+    def test_pr23_mesh_before_bed_wait_regression(self):
+        self._mutated("machine/fdm_a250.json", b"M140 S{first_layer_bed_temperature[initial_extruder]}\\n",
+                      b"M140 S{first_layer_bed_temperature[initial_extruder]}\\n{if printer_notes=~/.*SM2_ADAPTIVE_MESH.*/}"
+                      b"G1029 A L0.00 R10.00 F0.00 B10.00\\n{endif}", "SM2-GC-MESH")
+
+    def test_pr23_mesh_on_dual_regression(self):
+        self._mutated("machine/fdm_a250_dual.json", b"M190 R{first_layer_bed_temperature[initial_extruder]}\\n",
+                      b"M190 R{first_layer_bed_temperature[initial_extruder]}\\n{if printer_notes=~/.*SM2_ADAPTIVE_MESH.*/}"
+                      b"G1029 A L0.00 R10.00 F0.00 B10.00\\n{endif}", "SM2-GC-MESH")
 
     def test_pr01_pause_empty_regression(self):
         self._mutated("machine/fdm_a250.json", b'"machine_pause_gcode": "M600"', b'"machine_pause_gcode": ""',
