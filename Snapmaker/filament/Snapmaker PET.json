@@ -64,6 +64,12 @@
   "filament_unloading_speed_start": [
     "3"
   ],
+  "nozzle_temperature": [
+    "275"
+  ],
+  "nozzle_temperature_range_high": [
+    "275"
+  ],
   "overhang_fan_speed": [
     "60"
   ],
