@@ -13,20 +13,21 @@ community profiles and are the ones used for the owner's **A250T**.
 - `scripts/test_validate_profiles.py` - stdlib `unittest` suite for the validator and the SM2 preset fixes.
 - `scripts/render_start_gcode.py` - stdlib subset of Orca's PlaceholderParser: renders a printer's start G-code for a
   given first-layer footprint (`python3 -I scripts/render_start_gcode.py "Snapmaker A250 (0.4 nozzle)" --footprint
-  90,100,140,150 [--extruder 1] [--mvs 2]`). Used by rule SM2-GC-PURGE; matched real OrcaSlicer 2.5.0-beta CLI output
-  line for line on 4 reference slices (PR-09).
+  90,100,140,150 [--extruder 1] [--mvs 2] [--moves]`; `--moves` = only the `; SM2_*` comments and moves). Used by rules
+  SM2-GC-PURGE and SM2-GC-PARK; matched real OrcaSlicer 2.5.0-beta CLI output line for line on 4 reference slices (PR-09)
+  and on all start-section G0/G1 lines of 6 slices (smart park).
 - No CI here; OrcaSlicer's `.github/workflows/check_profiles.yml` checks this bundle after syncing it.
 - No licence file, no README, no tags.
 
-## Build and test (macOS, verified 07/11/2026, re-run 08/11/2026 at 6dba6d3)
+## Build and test (macOS, verified 07/11/2026, re-run 08/11/2026 at 8ee9b52)
 ```sh
 cd /Users/icaro/Documents/Projects/SnapMaker/snapmaker-profiles
 python3 -I scripts/validate_profiles.py            # RESULT: PASS (A250/A350 subset), exit 0
 python3 -I scripts/validate_profiles.py -v         # + geometry details
 python3 -I scripts/validate_profiles.py --strict   # exit 1: the 9 "other" (U1) issues below
-python3 -I -B scripts/test_validate_profiles.py    # 44 tests, OK (~3 s; copies the bundle to a temp dir; -B: no __pycache__)
+python3 -I -B scripts/test_validate_profiles.py    # 56 tests, OK (~3 s; copies the bundle to a temp dir; -B: no __pycache__)
 ```
-Current result (08/11/2026, 02.03.04.09+a250t): `0 A250/A350 error(s), 9 other-printer issue(s), 33 warning(s),
+Current result (08/11/2026, 02.03.04.10+a250t): `0 A250/A350 error(s), 9 other-printer issue(s), 33 warning(s),
 16 info`, plus a `RULES:` line with counts per rule ID. Other = upstream U1: 4x `default_print_profile` missing,
 1 duplicate `Snapmaker PLA SnapSpeed @U1 base`, 4x `SM2-GC-BEDTYPE` (U1 start G-code compares `curr_bed_type` with
 the UI label "Smooth PEI Plate", upstream PR2). Warnings (known, not fixed): `SM2-LIM-XY` x2 (XY 150 > firmware 120,
@@ -40,7 +41,11 @@ SM2-GC-DRIFT (A250 vs A350 twin templates), SM2-GC-BEDTYPE, SM2-GC-HOTBED, SM2-G
 SM2-GC-PAUSE (every A250/A350 printer's `machine_pause_gcode` must resolve to a template with an `M600` line, PR-01),
 SM2-GC-PURGE (start G-code uses `first_layer_print_min/max`, `print_bed_min/max`, `nozzle_diameter[`,
 `filament_max_volumetric_speed[`; rendered for 9 sample footprints per printer, T0/T1 on Dual: all G0/G1 on the bed and
-outside `bed_exclude_area`, purge >= 4 mm from the footprint unless fallback, F <= 3420, flow <= MVS; PR-09).
+outside `bed_exclude_area`, purge >= 4 mm from the footprint unless fallback, F <= 3420, flow <= MVS; PR-09),
+SM2-GC-PARK (start G-code builds `sm2_park_x/y` from `sm2_purge_x/y/sx/sy`; rendered for 11 footprints: the first XY
+move after G28 and the flush blob sit on the `; SM2_PARK` point, which is on the bed, X >= 10 mm inside, outside
+`bed_exclude_area`, >= 10 mm and no closer than the purge start to the footprint, >= 8 mm from every purge extrusion,
+<= 15 mm from the purge line; fallback exempt; smart park). PURGE and PARK share the footprint list (9 + 2 clamp cases).
 The `RULES:` line lists only rules with findings.
 Orca's CI checker must run on a scratch copy (it reads `<script>/../resources/profiles`): copy
 `OrcaSlicer/scripts/orca_extra_profile_check.py` to `<S>/scripts/`, `OrcaSlicer/resources/profiles/OrcaFilamentLibrary*`
@@ -52,7 +57,7 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
 ## Directory map
 | Path | Purpose |
 |---|---|
-| `Snapmaker.json` | Bundle index. `version` (line 3, `02.03.04.09+a250t`), `machine_model_list`, `process_list` (:84), `filament_list` (:534), `machine_list` (:1788). Each entry `{name, sub_path}`. |
+| `Snapmaker.json` | Bundle index. `version` (line 3, `02.03.04.10+a250t`), `machine_model_list`, `process_list` (:84), `filament_list` (:534), `machine_list` (:1788). Each entry `{name, sub_path}`. |
 | `Snapmaker/machine/` (119) | `Snapmaker <Model>.json` (type `machine_model`), `fdm_*` abstract bases, `Snapmaker <Model> (<n> nozzle).json` printers. |
 | `Snapmaker/process/` (112) | `fdm_process_*` bases; `0.xx <Quality> @Snapmaker[ J1| Artisan| U1] (<n> nozzle).json`. SM2 uses plain `@Snapmaker`. |
 | `Snapmaker/filament/` (316) | `fdm_filament_common`, `fdm_filament_<type>_category` bases; `Snapmaker <type>[ @Dual][ @U1][ @0.x nozzle]`, `Generic ...`, Polymaker. |
@@ -81,8 +86,13 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
   Purge (PR-09): `{local sm2_*}` lines right after the header pick a 100 mm two-pass line in front of the first-layer
   footprint, else left, else right (15/10 mm from it, X 10 mm inside the bed, never behind it), else the old X40 Y0
   180 mm line; width 1.25 x nozzle at Z0.3, feed min(3420, MVS-limited), primes E4/E3 capped by MVS;
-  `sm2_purge_x/y` = first-pass start; output comment `; SM2_PURGE <side> start X.. Y..`. The flush blob at X10 Y0 is
-  still fixed. Kits: BK 224, QS 215, QS+BK 209, Dual 190, Dual BK 184, Dual QS 175,
+  `sm2_purge_x/y` = first-pass start; output comment `; SM2_PURGE <side> start X.. Y..`.
+  Smart park: `sm2_park_*` locals put the flush wait (`M109 ... C2 W1` at Z1.6) and the `G1 E4` blob 10 mm behind the
+  purge start along the line and 10 mm further from the part, X clamped to 10 mm inside the bed, Y >= bed min; if the
+  clamps leave it < 10 mm from the purge start it goes 10 mm past the first pass end; fallback keeps X10 Y0. Then the
+  old slow lift (Z5.6 F200, fan on), travel, Z0.3, `M109 ... C3 W1` at the purge start. Comment
+  `; SM2_PARK start|end X.. Y..`. `; SM2_MESH` comment right after `M190 R..` = slot for the adaptive `G1029` (PR-23);
+  the SM2 `G28` already re-enables the saved mesh (controller `G28.cpp:486-494`). Kits: BK 224, QS 215, QS+BK 209, Dual 190, Dual BK 184, Dual QS 175,
   Dual QS+BK 169 mm; QS/Dual add `bed_exclude_area`.
 - `fdm_a250_dual.json:25`: `change_filament_gcode` (T{next}, `M107 P`, `M109 T.. C3 W1`; header comment
   `; Change T<a> -> T<b> layer <n> z <z>`). On layer_num 1 (0-based = 2nd layer) with PLA/TPU it sets
@@ -146,6 +156,8 @@ PR-01 08/11/2026: 12a494f `machine_pause_gcode` M600 on the four SM2 bases + rul
 version 02.03.04.08+a250t (pushed to the icaroNZ fork).
 PR-09 08/11/2026: 2c1c239 `render_start_gcode.py`; 3d8a9f8 footprint/nozzle/MVS-aware purge in the four SM2 start
 templates + rule SM2-GC-PURGE + tests (44); 6dba6d3 version 02.03.04.09+a250t (local, not pushed; gitlink not moved).
+Smart park 08/11/2026: df0f9fc flush/park point derived from the purge start + rule SM2-GC-PARK + `--moves` + tests (56);
+8ee9b52 version 02.03.04.10+a250t (local, not pushed; gitlink not moved).
 Fix list:
 `../_snapmaker2-review/issues/snapmaker-profiles.md`. Details:
 `../_snapmaker2-review/integration/snapmaker-profiles.md`.
