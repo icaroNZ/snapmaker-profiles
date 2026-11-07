@@ -8,6 +8,7 @@ Run:  python3 -I scripts/test_validate_profiles.py [-v]
   regression re-applied per test (must FAIL with the matching rule ID), so every fix in the
   a250t fix pass stays covered.
 * A line-ending test guards the CRLF preset files against accidental LF conversion.
+* Renderer tests pin the Orca PlaceholderParser semantics that render_start_gcode.py mirrors.
 """
 
 import glob
@@ -23,6 +24,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import validate_profiles as vp  # noqa: E402
+import render_start_gcode as rsg  # noqa: E402
 
 MACHINE = os.path.join(ROOT, "Snapmaker", "machine")
 
@@ -108,6 +110,45 @@ class RuleUnitTests(unittest.TestCase):
         self.assertEqual([r for r, _ in vp.rule_compat_kit(["Snapmaker A250 (0.2 nozzle)"], allp)],
                          ["warn:SM2-COMPAT-KIT"])
         self.assertEqual(vp.rule_compat_kit(allp, allp), [])
+
+
+class RendererTests(unittest.TestCase):
+    """render_start_gcode.py must follow OrcaSlicer src/libslic3r/PlaceholderParser.cpp where the SM2 templates rely on it."""
+
+    def r(self, text, **variables):
+        return rsg.render(text, variables)[0]
+
+    def test_arithmetic_types(self):
+        self.assertEqual(self.r("{7/2} {7.0/2} {-7/2} {7%3} {1.0/3}"), "3 3.5 -3 1 0.333333")  # int division truncates
+        self.assertEqual(self.r("{min(3, 4)} {max(3, 4.0)} {min(2.5, 3)}"), "3 4 2.5")      # %g output, int stays int
+        self.assertEqual(self.r("{digits(3.14159, 0, 2)} {digits(2.5, 0)} {int(2.9)} {round(-2.5)}"), "3.14 3 2 -3")
+
+    def test_vectors_and_legacy(self):
+        self.assertEqual(self.r("{v[1]} {v[5]} [i] [s]", v=[1.5, 2.5], i=1, s="x"), "2.5 1.5 1 x")  # out of range -> [0]
+        with self.assertRaises(rsg.RenderError):
+            self.r("{v}", v=[1.0])
+        with self.assertRaises(rsg.RenderError):
+            self.r("; [ not a variable")  # Orca: '[' in text must be a legacy expansion
+
+    def test_if_blocks_and_locals(self):
+        tpl = '{local a = 2.0; local s = a > 1 ? "big" : "small"}{if s == "big"}B{a * 2}{elsif a > 0}P{else}N{endif}'
+        self.assertEqual(self.r(tpl), "B4")
+        self.assertEqual(self.r("{if false}{1/0}{endif}ok"), "ok")  # skipped branches are not evaluated
+        with self.assertRaises(rsg.RenderError):
+            self.r("{if false}{local a = 1}{endif}{a}")  # a local declared in a skipped branch does not exist
+        with self.assertRaises(rsg.RenderError):
+            self.r("{local a = (1 + 2) * 3}")  # Orca: leading '(' is a vector initializer
+        with self.assertRaises(rsg.RenderError):
+            self.r("{local nozzle_diameter = 1}", nozzle_diameter=[0.4])  # read-only system symbol
+        with self.assertRaises(rsg.RenderError):
+            self.r("{if 1}x{endif}")  # not a boolean
+
+    def test_current_templates_render(self):
+        for base in FixedTemplateTests.BASES:
+            cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), base[:-5])
+            for key in ("machine_start_gcode",):  # end/toolchange templates need layer and toolchange data
+                text, _ = rsg.render(cfg[key], rsg.sample_variables(cfg, (90, 100, 140, 150)))
+                self.assertNotIn("{", text, (base, key))
 
 
 class FixedTemplateTests(unittest.TestCase):
