@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Render Snapmaker Orca custom G-code templates offline (subset of Orca's PlaceholderParser).
 
-Used by validate_profiles.py (rule SM2-GC-PURGE) and its tests to check the SM2 start G-code for
-concrete first-layer footprints, and usable on its own:
+Used by validate_profiles.py (rules SM2-GC-PURGE and SM2-GC-PARK) and its tests to check the SM2 start
+G-code for concrete first-layer footprints, and usable on its own:
 
     python3 -I scripts/render_start_gcode.py "Snapmaker A250 (0.4 nozzle)" --footprint 90,100,140,150
+    python3 -I scripts/render_start_gcode.py "Snapmaker A250 Dual (0.4 nozzle)" --footprint 0,0,30,30 --extruder 1 --moves
+
+``--moves`` prints only the ``; SM2_*`` diagnostic comments (purge side/start, park point, mesh slot) and the
+G0/G1/G28/M109/M190 lines, i.e. where the nozzle parks, waits, drops the flush blob and purges.
 
 The semantics follow OrcaSlicer src/libslic3r/PlaceholderParser.cpp (a250t/main):
 * text outside braces is copied verbatim; ``[name]`` is a legacy expansion, and any other ``[`` in
@@ -589,10 +593,15 @@ def main(argv=None):
     ap.add_argument("--extruder", type=int, default=0, help="initial_extruder")
     ap.add_argument("--mvs", type=float, default=15.0, help="filament_max_volumetric_speed (mm^3/s)")
     ap.add_argument("--key", default="machine_start_gcode")
+    ap.add_argument("--moves", action="store_true",
+                    help="print only the '; SM2_*' comments and the G0/G1/G28/M109/M190 lines")
     args = ap.parse_args(argv)
     cfg = resolve_machine(load_machine_presets(args.root), args.printer)
     fp = tuple(float(v) for v in args.footprint.split(","))
     text, local = render(cfg.get(args.key, ""), sample_variables(cfg, fp, args.extruder, args.mvs), args.extruder)
+    if args.moves:
+        keep = re.compile(r"^(; SM2_(PURGE|PARK|MESH) |G[01] |G28\b|M1(09|90) )")
+        text = "\n".join(l for l in text.split("\n") if keep.match(l) and " plan" not in l[:16])
     sys.stdout.write(text + "\n")
     return 0
 

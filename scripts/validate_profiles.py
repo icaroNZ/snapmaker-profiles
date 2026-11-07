@@ -42,6 +42,12 @@ on) when it loads ``Snapmaker.json`` in ``PresetBundle::load_vendor_configs_from
                 placeholders, and (rendered offline by render_start_gcode.py for sample footprints) every
                 G0/G1 stays on the bed and outside bed_exclude_area, the purge line keeps clear of the
                 footprint unless it falls back to the old X40 Y0 line, and its flow stays <= filament MVS
+  SM2-GC-PARK   the flush wait / E4 blob point ("smart park") is derived from the purge locals: rendered for the
+                same footprints, the first XY move after G28 and every stationary extrusion before the purge sit on
+                the '; SM2_PARK' point, which is on the bed, X >= 10 mm inside it (Dual T1 reach), outside
+                bed_exclude_area, at least as far from the footprint as the purge start (>= 10 mm unless fallback),
+                >= 8 mm from every purge extrusion (the nozzle never lands on the blob) and <= 15 mm from the purge
+                line (fallback: the old X10 Y0 corner)
 
 Findings that involve the Snapmaker 2.0 A250/A350 presets (directly, or as a
 base of them) are ERRORs and make the script exit with status 1. Findings on
@@ -112,6 +118,13 @@ PURGE_PLACEHOLDERS = ("first_layer_print_min", "first_layer_print_max", "nozzle_
 PURGE_MARKER_RE = re.compile(r"^; SM2_PURGE (front|left|right|fallback) start X(-?[\d.]+) Y(-?[\d.]+)", re.M)
 PURGE_MAX_F = 3420.0          # mm/min, the old fixed purge feed
 PURGE_CLEARANCE = 4.0         # mm between purge extrusion and first-layer footprint (template: 5 mm)
+# SM2-GC-PARK (smart park): locals the park point must be built from, its comment, and its limits.
+PARK_LOCALS = ("sm2_purge_x", "sm2_purge_y", "sm2_purge_sx", "sm2_purge_sy", "sm2_park_x", "sm2_park_y")
+PARK_MARKER_RE = re.compile(r"^; SM2_PARK (start|end) X(-?[\d.]+) Y(-?[\d.]+)", re.M)
+PARK_X_MARGIN = 10.0          # mm inside the bed in X, as the purge (A250/A350 Dual T1 reach, PR-09)
+PARK_CLEARANCE = 10.0         # mm between the blob point and the footprint (template: purge 15 mm + 10 mm)
+PARK_SEPARATION = 8.0         # mm between the blob point and any purge extrusion (template: 10 mm)
+PARK_NEAR = 15.0              # mm: the blob point is beside the purge line (template: <= 14.2 mm)
 SM2_PRINTER_RE = re.compile(r"^Snapmaker (A250|A350)( Dual)?( QSKit| BKit| QS\+B Kit)? \((\d+(?:\.\d+)?) nozzle\)$")
 
 
@@ -320,6 +333,8 @@ def purge_footprints(usable):
         ("centre", (cx - 25, cy - 25, cx + 25, cy + 25), True),
         ("full-depth strip at the left edge", (x0, y0, x0 + 20, y1), True),
         ("full-depth strip in the middle", (cx - 15, y0, cx + 15, y1), True),
+        ("20 mm in from the front-left corner", (x0 + 5, y0 + 20, x0 + 50, y0 + 60), True),
+        ("front edge, 30 mm from the left edge", (x0 + 30, y0, x0 + 80, y0 + 40), True),
         ("full-width strip at the front", (x0, y0, x1, y0 + 20), False),
         ("near-full bed", (x0 + 5, y0 + 5, x1 - 5, y1 - 5), False),
     ]
@@ -378,6 +393,98 @@ def check_purge_render(start, cfg, footprint, initial_extruder, mvs, must_have_r
             if limit > 0 and flow > limit * 1.01:
                 problems.append("%r flows %.2f mm3/s > filament MVS %g" % (mv["line"], flow, limit))
     return problems
+
+
+def _point_seg_dist(px, py, seg):
+    """Distance from a point to a segment (x0, y0, x1, y1)."""
+    x0, y0, x1, y1 = seg
+    dx, dy = x1 - x0, y1 - y0
+    ll = dx * dx + dy * dy
+    t = 0.0 if ll == 0 else max(0.0, min(1.0, ((px - x0) * dx + (py - y0) * dy) / ll))
+    cx, cy = x0 + t * dx - px, y0 + t * dy - py
+    return (cx * cx + cy * cy) ** 0.5
+
+
+def check_park_render(start, cfg, footprint, initial_extruder, mvs):
+    """Render the start G-code for one footprint; return problems with the flush/park point (empty = fine)."""
+    rsg = renderer()
+    bed, excl = rsg.bed_geometry(cfg)
+    try:
+        text, local = rsg.render(start, rsg.sample_variables(cfg, footprint, initial_extruder, mvs), initial_extruder)
+        moves = rsg.gcode_moves(text)
+    except rsg.RenderError as exc:
+        return ["does not render: %s" % exc]
+    pm, km = PURGE_MARKER_RE.search(text), PARK_MARKER_RE.search(text)
+    if not pm or not km:
+        return ["rendered G-code has no '; SM2_PURGE <side> start X.. Y..' and '; SM2_PARK <start|end> X.. Y..' lines"]
+    side, sx, sy = pm.group(1), float(pm.group(2)), float(pm.group(3))
+    kx, ky = float(km.group(2)), float(km.group(3))
+    same = lambda x, y: x is not None and y is not None and abs(x - kx) < 0.006 and abs(y - ky) < 0.006
+    problems = []
+    xy = [k for k, mv in enumerate(moves) if mv["xy"]]
+    if not xy or not same(moves[xy[0]]["x"], moves[xy[0]]["y"]):
+        problems.append("first XY move after G28 %r is not the SM2_PARK point X%g Y%g"
+                        % (moves[xy[0]]["line"] if xy else None, kx, ky))
+    try:  # travel to the purge start = first move that lands on it
+        k_start = next(k for k, mv in enumerate(moves) if mv["xy"] and mv["x"] is not None and mv["y"] is not None
+                       and abs(mv["x"] - sx) < 0.006 and abs(mv["y"] - sy) < 0.006)
+    except StopIteration:
+        return problems + ["no travel to the purge start X%g Y%g" % (sx, sy)]
+    blobs = [mv for mv in moves[:k_start] if not mv["xy"] and mv["e"] and mv["e"] > 0]
+    if not blobs:
+        problems.append("no stationary flush extrusion before the purge")
+    for mv in blobs:
+        if not same(mv["x0"], mv["y0"]):
+            problems.append("flush extrusion %r at X%s Y%s, not at the SM2_PARK point X%g Y%g"
+                            % (mv["line"], mv["x0"], mv["y0"], kx, ky))
+    if not (bed[0] + PARK_X_MARGIN - 1e-6 <= kx <= bed[2] - PARK_X_MARGIN + 1e-6 and bed[1] - 1e-6 <= ky <= bed[3] + 1e-6):
+        problems.append("park point X%g Y%g outside the bed %s less %g mm in X" % (kx, ky, bed, PARK_X_MARGIN))
+    for ex in excl:
+        if ex[0] < kx < ex[2] and ex[1] < ky < ex[3]:
+            problems.append("park point X%g Y%g is inside bed_exclude_area %s" % (kx, ky, ex))
+    segs = [(mv["x0"], mv["y0"], mv["x"], mv["y"]) for mv in moves[k_start:]
+            if mv["xy"] and mv["e"] and mv["e"] > 0 and mv["x0"] is not None and mv["y0"] is not None]
+    if segs:
+        near = min(_point_seg_dist(kx, ky, sg) for sg in segs)
+        if near < PARK_SEPARATION:
+            problems.append("park point X%g Y%g is %.2f mm from the purge extrusion (< %g: the nozzle would land on"
+                            " or drag the blob)" % (kx, ky, near, PARK_SEPARATION))
+        if side != "fallback" and near > PARK_NEAR:
+            problems.append("park point X%g Y%g is %.2f mm from the purge line (> %g: not derived from the purge)"
+                            % (kx, ky, near, PARK_NEAR))
+    if side != "fallback":
+        gap, gap_start = _rect_gap((kx, ky, kx, ky), footprint), _rect_gap((sx, sy, sx, sy), footprint)
+        if gap < PARK_CLEARANCE or gap < gap_start - 1e-6:
+            problems.append("park point X%g Y%g is %.2f mm from the footprint %s (purge start %.2f mm, minimum %g)"
+                            % (kx, ky, gap, footprint, gap_start, PARK_CLEARANCE))
+    return problems
+
+
+def rule_gc_park(start, cfg):
+    """SM2-GC-PARK (smart park) for one resolved SM2 printer preset."""
+    text = str(start or "")
+    missing = [p for p in PARK_LOCALS if p not in text]
+    if missing:
+        return [("SM2-GC-PARK", "flush/park point is not derived from the purge locals (missing %s; the old fixed"
+                                " X10 Y0 corner puts the blob on a part in that corner)" % ", ".join(missing))]
+    nozzles = as_list(cfg.get("nozzle_diameter"))
+    key = ("park", text, tuple(nozzles), tuple(as_list(cfg.get("printable_area"))),
+           tuple(as_list(cfg.get("bed_exclude_area"))))
+    if key in _PURGE_CACHE:
+        return _PURGE_CACHE[key]
+    nozzle = to_float(nozzles[0]) if nozzles else 0.4
+    mvs = 2.0 if nozzle is not None and nozzle <= 0.25 else 15.0
+    out = []
+    for label, fp, _room in purge_footprints(renderer().usable_bed(cfg)):
+        for ie in ((0, 1) if len(nozzles) > 1 else (0,)):
+            probs = check_park_render(text, cfg, fp, ie, mvs)
+            if probs:
+                out.append(("SM2-GC-PARK", "%s (T%d): %s" % (label, ie, probs[0])))
+                break
+        if out:
+            break
+    _PURGE_CACHE[key] = out
+    return out
 
 
 def rule_gc_purge(start, cfg):
@@ -755,6 +862,7 @@ def check_sm2_rules(presets, resolve, machines_inst, sm2_scope, report):
             if key == "machine_start_gcode":
                 emit(rule_gc_hotbed(text) + rule_gc_flush(text, single), where)
                 emit([(r, "%s: %s" % (name, msg)) for r, msg in rule_gc_purge(text, cfg)], where)
+                emit([(r, "%s: %s" % (name, msg)) for r, msg in rule_gc_park(text, cfg)], where)
             if key == "change_filament_gcode":
                 emit(rule_gc_bedmin(text), where)
         # outside the GCODE_KEYS loop: that loop skips empty values, and a missing pause G-code is the bug

@@ -9,7 +9,8 @@ Run:  python3 -I scripts/test_validate_profiles.py [-v]
   a250t fix pass stays covered.
 * A line-ending test guards the CRLF preset files against accidental LF conversion.
 * Renderer tests pin the Orca PlaceholderParser semantics that render_start_gcode.py mirrors, and purge
-  tests render the SM2 start G-code for concrete footprints (PR-09).
+  tests render the SM2 start G-code for concrete footprints (PR-09); park tests pin the flush/blob point
+  that follows the purge start (smart park).
 """
 
 import glob
@@ -158,8 +159,9 @@ class PurgeTests(unittest.TestCase):
     def render(self, printer, footprint, ie=0, mvs=15.0):
         cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), printer)
         text, local = rsg.render(cfg["machine_start_gcode"], rsg.sample_variables(cfg, footprint, ie, mvs), ie)
-        purge = [m["line"] for m in rsg.gcode_moves(text) if m["line"].startswith(("G0 X", "G1 X"))
-                 and "X10 F" not in m["line"]]
+        moves = [m["line"] for m in rsg.gcode_moves(text)]
+        after_lift = moves[moves.index("G0 Z5.6 F200") + 1:]  # purge moves: after the lift off the flush blob
+        purge = [l for l in after_lift if l.startswith(("G0 X", "G1 X"))]
         return text, local, purge
 
     def test_centre_part_purges_in_front(self):
@@ -216,6 +218,84 @@ class PurgeTests(unittest.TestCase):
         cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), "Snapmaker A250 (0.4 nozzle)")
         old = "G0 X40 F3420.0\nG0 Z0.3 F960.0\nG1 X220 E12 F3420.0\n"
         self.assertEqual([r for r, _ in vp.rule_gc_purge(old, cfg)], ["SM2-GC-PURGE"])
+
+
+class ParkTests(unittest.TestCase):
+    """Smart park: the flush wait and E4 blob sit beside the purge start instead of the fixed X10 Y0 corner."""
+
+    def render(self, printer, footprint, ie=0, mvs=15.0):
+        cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), printer)
+        text, local = rsg.render(cfg["machine_start_gcode"], rsg.sample_variables(cfg, footprint, ie, mvs), ie)
+        moves = rsg.gcode_moves(text)
+        blob = [m for m in moves if not m["xy"] and m["e"] and m["e"] > 0][0]  # G1 E4, the first stationary prime
+        return text, local, moves, (blob["x0"], blob["y0"])
+
+    def test_corner_part_no_longer_gets_the_blob(self):
+        fp = (0, 0, 30, 30)
+        self.assertEqual(vp._rect_gap((10, 0, 10, 0), fp), 0.0)  # the old X10 Y0 blob landed on this part
+        text, local, moves, blob = self.render("Snapmaker A250 (0.4 nozzle)", fp)
+        self.assertIn("; SM2_PARK start X55.00 Y0.00", text)       # purge "right" at X45, blob 10 mm further right
+        self.assertEqual(blob, (55.0, 0.0))
+        self.assertEqual(moves[0]["line"], "G0 X55.00 Y0.00 F3420.0")
+        self.assertGreaterEqual(vp._rect_gap((55, 0, 55, 0), fp), 25.0)
+        self.assertNotIn("G0 X10 F3420.0", text)
+
+    def test_centre_part_parks_behind_and_in_front_of_the_purge_start(self):
+        text, local, _, blob = self.render("Snapmaker A250 (0.4 nozzle)", (90, 100, 140, 150))
+        self.assertEqual((local["sm2_purge_x"], local["sm2_purge_y"]), (90.0, 85.0))
+        self.assertEqual(blob, (80.0, 75.0))
+        self.assertFalse(local["sm2_park_at_end"])
+
+    def test_clamped_start_moves_the_blob_past_the_first_pass_end(self):
+        # front purge at X10 Y5: 10 mm behind/in front would clamp to 5 mm from the start, where the nozzle lands
+        text, local, _, blob = self.render("Snapmaker A250 (0.4 nozzle)", (5, 20, 50, 60))
+        self.assertIn("; SM2_PARK end X120.00 Y0.00", text)
+        self.assertEqual(blob, (120.0, 0.0))
+        _, local, _, blob = self.render("Snapmaker A250 (0.4 nozzle)", (30, 0, 80, 40))  # left purge X15 Y0..100
+        self.assertEqual((local["sm2_purge_side"], blob), ("left", (10.0, 110.0)))
+
+    def test_fallback_keeps_the_old_corner(self):
+        text, local, moves, blob = self.render("Snapmaker A250 (0.4 nozzle)", (5, 5, 225, 245))
+        self.assertEqual((local["sm2_purge_side"], blob), ("fallback", (10.0, 0.0)))
+        _, _, _, blob = self.render("Snapmaker A350 (0.4 nozzle)", (5, 5, 315, 345))
+        self.assertEqual(blob, (10.0, 0.0))
+
+    def test_dual_t1_stays_in_reach(self):
+        for fp in ((90, 100, 140, 150), (0, 0, 30, 30), (200, 0, 230, 30), (5, 20, 50, 60)):
+            _, local, _, blob = self.render("Snapmaker A250 Dual (0.4 nozzle)", fp, ie=1, mvs=[15.0, 15.0])
+            self.assertTrue(10.0 <= blob[0] <= 220.0 and blob[1] >= 0.0, (fp, blob))
+
+    def test_heat_order_and_mesh_slot(self):
+        """Order kept from PR-09: home, bed wait, (mesh slot), park at Z1.6, flush wait, blob, lift, purge."""
+        for base in FixedTemplateTests.BASES:
+            lines = template(base, "machine_start_gcode").split("\n")
+            def at(prefix):
+                hits = [i for i, l in enumerate(lines) if l.startswith(prefix)]
+                self.assertEqual(len(hits), 1, (base, prefix, hits))
+                return hits[0]
+            # A350 single lowers with "G1 Z0.4" (the drift rule reads G1 without E as G0)
+            order = [at("G28"), at("M190 R"), at("; SM2_MESH "), at("G0 X{digits(sm2_park_x"), at("G0 Z1.6 F960.0"),
+                     at("M109 S{min(2"), at(("G0 Z0.4 F200", "G1 Z0.4 F200")), at("G1 E4 F"), at("G0 Z5.6 F200"),
+                     at("G0 X{digits(sm2_purge_x, 0, 2)}"), at("G0 Z0.3 F960.0"), at("M109 S{nozzle_temperature_initial")]
+            self.assertEqual(order, sorted(order), base)
+            self.assertEqual(lines[at("; SM2_MESH ") - 1], "M190 R{first_layer_bed_temperature[initial_extruder]}")
+            self.assertTrue(lines[at("M109 S{min(2")].endswith(" C2 W1"), base)
+
+    def test_rule_passes_on_every_base(self):
+        for printer in ("Snapmaker A250 (0.4 nozzle)", "Snapmaker A250 Dual QS+B Kit (0.2 nozzle)",
+                        "Snapmaker A350 QSKit (0.8 nozzle)", "Snapmaker A350 Dual (0.4 nozzle)"):
+            cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), printer)
+            self.assertEqual(vp.rule_gc_park(cfg["machine_start_gcode"], cfg), [], printer)
+
+    def test_rule_catches_fixed_corner(self):
+        cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), "Snapmaker A250 (0.4 nozzle)")
+        start = cfg["machine_start_gcode"]
+        fixed = start.replace("G0 X{digits(sm2_park_x, 0, 2)} Y{digits(sm2_park_y, 0, 2)} F3420.0",
+                              "G0 X10 F3420.0\nG0 Y0 F3420.0")
+        self.assertNotEqual(fixed, start)
+        found = vp.rule_gc_park(fixed, cfg)
+        self.assertEqual([r for r, _ in found], ["SM2-GC-PARK"])
+        self.assertIn("SM2_PARK point", found[0][1])
 
 
 class FixedTemplateTests(unittest.TestCase):
@@ -323,6 +403,21 @@ class BundleTests(unittest.TestCase):
     def test_pr09_purge_parse_error_regression(self):
         self._mutated("machine/fdm_a250.json", b"local sm2_purge_ex = sm2_purge_x + (",
                       b"local sm2_purge_ex = (sm2_purge_x) + (", "SM2-GC-PURGE")
+
+    def test_park_fixed_corner_regression(self):
+        self._mutated("machine/fdm_a250.json", b"G0 X{digits(sm2_park_x, 0, 2)} Y{digits(sm2_park_y, 0, 2)} F3420.0",
+                      b"G0 X10 F3420.0\\nG0 Y0 F3420.0", "SM2-GC-PARK")
+
+    def test_park_sign_regression(self):  # blob towards the part instead of away from it
+        self._mutated("machine/fdm_a350.json", b"sm2_purge_sx > 0 ? 0.0 - sm2_park_d : sm2_purge_sx < 0 ? sm2_park_d",
+                      b"sm2_purge_sx > 0 ? sm2_park_d : sm2_purge_sx < 0 ? 0.0 - sm2_park_d", "SM2-GC-PARK")
+
+    def test_park_clamp_regression(self):
+        self._mutated("machine/fdm_a250_dual.json", b"local sm2_park_y1 = max(sm2_by0, sm2_purge_y + sm2_park_oy",
+                      b"local sm2_park_y1 = min(sm2_by0, sm2_purge_y + sm2_park_oy", "SM2-GC-PARK")
+
+    def test_park_no_end_fallback_regression(self):  # clamped blob 5 mm from where the nozzle lands for the purge
+        self._mutated("machine/fdm_a350_dual.json", b"sm2_park_d * sm2_park_d - 0.01}", b"0.0 - 1.0}", "SM2-GC-PARK")
 
     def test_pr01_pause_empty_regression(self):
         self._mutated("machine/fdm_a250.json", b'"machine_pause_gcode": "M600"', b'"machine_pause_gcode": ""',
