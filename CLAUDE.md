@@ -13,21 +13,23 @@ community profiles and are the ones used for the owner's **A250T**.
 - `scripts/test_validate_profiles.py` - stdlib `unittest` suite for the validator and the SM2 preset fixes.
 - `scripts/render_start_gcode.py` - stdlib subset of Orca's PlaceholderParser: renders a printer's start G-code for a
   given first-layer footprint (`python3 -I scripts/render_start_gcode.py "Snapmaker A250 (0.4 nozzle)" --footprint
-  90,100,140,150 [--extruder 1] [--mvs 2] [--moves]`; `--moves` = only the `; SM2_*` comments and moves). Used by rules
-  SM2-GC-PURGE and SM2-GC-PARK; matched real OrcaSlicer 2.5.0-beta CLI output line for line on 4 reference slices (PR-09)
-  and on all start-section G0/G1 lines of 6 slices (smart park).
+  90,100,140,150 [--extruder 1] [--mvs 2] [--moves] [--adaptive] [--margin 5]`; `--moves` = only the `; SM2_*` comments
+  and moves; `--adaptive` = add the PR-23 opt-in token to `printer_notes`). Supports Orca's `=~`/`!~` regex match. Used by
+  rules SM2-GC-PURGE, SM2-GC-PARK and SM2-GC-MESH; matched real OrcaSlicer 2.5.0-beta CLI output line for line on 4
+  reference slices (PR-09), on all start-section G0/G1 lines of 6 slices (smart park) and on the `G1029` line of 7
+  adaptive-mesh slices (PR-23).
 - No CI here; OrcaSlicer's `.github/workflows/check_profiles.yml` checks this bundle after syncing it.
 - No licence file, no README, no tags.
 
-## Build and test (macOS, verified 07/11/2026, re-run 08/11/2026 at 8ee9b52)
+## Build and test (macOS, verified 07/11/2026, re-run 08/11/2026 at b9210bb)
 ```sh
 cd /Users/icaro/Documents/Projects/SnapMaker/snapmaker-profiles
 python3 -I scripts/validate_profiles.py            # RESULT: PASS (A250/A350 subset), exit 0
 python3 -I scripts/validate_profiles.py -v         # + geometry details
 python3 -I scripts/validate_profiles.py --strict   # exit 1: the 9 "other" (U1) issues below
-python3 -I -B scripts/test_validate_profiles.py    # 56 tests, OK (~3 s; copies the bundle to a temp dir; -B: no __pycache__)
+python3 -I -B scripts/test_validate_profiles.py    # 71 tests, OK (~3 s; copies the bundle to a temp dir; -B: no __pycache__)
 ```
-Current result (08/11/2026, 02.03.04.10+a250t): `0 A250/A350 error(s), 9 other-printer issue(s), 33 warning(s),
+Current result (08/11/2026, 02.03.04.11+a250t): `0 A250/A350 error(s), 9 other-printer issue(s), 33 warning(s),
 16 info`, plus a `RULES:` line with counts per rule ID. Other = upstream U1: 4x `default_print_profile` missing,
 1 duplicate `Snapmaker PLA SnapSpeed @U1 base`, 4x `SM2-GC-BEDTYPE` (U1 start G-code compares `curr_bed_type` with
 the UI label "Smooth PEI Plate", upstream PR2). Warnings (known, not fixed): `SM2-LIM-XY` x2 (XY 150 > firmware 120,
@@ -46,6 +48,10 @@ SM2-GC-PARK (start G-code builds `sm2_park_x/y` from `sm2_purge_x/y/sx/sy`; rend
 move after G28 and the flush blob sit on the `; SM2_PARK` point, which is on the bed, X >= 10 mm inside, outside
 `bed_exclude_area`, >= 10 mm and no closer than the purge start to the footprint, >= 8 mm from every purge extrusion,
 <= 15 mm from the purge line; fallback exempt; smart park). PURGE and PARK share the footprint list (9 + 2 clamp cases).
+SM2-GC-MESH (PR-23, same footprints at `adaptive_bed_mesh_margin` 0 and 5 mm: no `G1029` unless `printer_notes`
+contains `SM2_ADAPTIVE_MESH`; with it single-head printers emit exactly one `G1029 A L.. R.. F.. B..` (no H/K/P) after
+`G28` and `M190 R` and before every G0/G1, region = `adaptive_bed_mesh_min/max` clamped to the bed, nothing else changes;
+Dual printers never emit `G1029`).
 The `RULES:` line lists only rules with findings.
 Orca's CI checker must run on a scratch copy (it reads `<script>/../resources/profiles`): copy
 `OrcaSlicer/scripts/orca_extra_profile_check.py` to `<S>/scripts/`, `OrcaSlicer/resources/profiles/OrcaFilamentLibrary*`
@@ -57,7 +63,7 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
 ## Directory map
 | Path | Purpose |
 |---|---|
-| `Snapmaker.json` | Bundle index. `version` (line 3, `02.03.04.10+a250t`), `machine_model_list`, `process_list` (:84), `filament_list` (:534), `machine_list` (:1788). Each entry `{name, sub_path}`. |
+| `Snapmaker.json` | Bundle index. `version` (line 3, `02.03.04.11+a250t`), `machine_model_list`, `process_list` (:84), `filament_list` (:534), `machine_list` (:1788). Each entry `{name, sub_path}`. |
 | `Snapmaker/machine/` (119) | `Snapmaker <Model>.json` (type `machine_model`), `fdm_*` abstract bases, `Snapmaker <Model> (<n> nozzle).json` printers. |
 | `Snapmaker/process/` (112) | `fdm_process_*` bases; `0.xx <Quality> @Snapmaker[ J1| Artisan| U1] (<n> nozzle).json`. SM2 uses plain `@Snapmaker`. |
 | `Snapmaker/filament/` (316) | `fdm_filament_common`, `fdm_filament_<type>_category` bases; `Snapmaker <type>[ @Dual][ @U1][ @0.x nozzle]`, `Generic ...`, Polymaker. |
@@ -67,7 +73,7 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
 | `Snapmaker/filament/filaments_colours.json` | Rule file: official colour SKUs. |
 | `scripts/validate_profiles.py` | Validator (a250t). |
 | `scripts/test_validate_profiles.py` | Validator/preset tests (a250t). |
-| `scripts/render_start_gcode.py` | Offline Orca template renderer + CLI (a250t, PR-09). |
+| `scripts/render_start_gcode.py` | Offline Orca template renderer + CLI (a250t, PR-09; regex + adaptive-mesh variables PR-23). |
 
 ## Key files for the Snapmaker 2.0
 - Chain: `Snapmaker A250 (0.4 nozzle).json` -> `fdm_a250.json` -> `fdm_linear2.json` -> `fdm_common.json`.
@@ -91,8 +97,15 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
   purge start along the line and 10 mm further from the part, X clamped to 10 mm inside the bed, Y >= bed min; if the
   clamps leave it < 10 mm from the purge start it goes 10 mm past the first pass end; fallback keeps X10 Y0. Then the
   old slow lift (Z5.6 F200, fan on), travel, Z0.3, `M109 ... C3 W1` at the purge start. Comment
-  `; SM2_PARK start|end X.. Y..`. `; SM2_MESH` comment right after `M190 R..` = slot for the adaptive `G1029` (PR-23);
-  the SM2 `G28` already re-enables the saved mesh (controller `G28.cpp:486-494`). Kits: BK 224, QS 215, QS+BK 209, Dual 190, Dual BK 184, Dual QS 175,
+  `; SM2_PARK start|end X.. Y..`. `; SM2_MESH` comment right after `M190 R..`; the SM2 `G28` already re-enables the
+  saved mesh (controller `G28.cpp:486-494`). Adaptive mesh (PR-23, single-head `fdm_a250`/`fdm_a350` only, OPT-IN):
+  directly after that comment `{if printer_notes=~/.*SM2_ADAPTIVE_MESH.*/}` emits `; SM2_MESH_ADAPTIVE on ...` and
+  `G1029 A L.. R.. F.. B..` = Orca `adaptive_bed_mesh_min/max` (first-layer bbox incl. skirt -/+ `adaptive_bed_mesh_margin`)
+  clamped to `print_bed_min/max`; no H/K (bed already hot; H would undo the screen's bed-temperature override). Turn on:
+  Printer settings > Notes, add a line `SM2_ADAPTIVE_MESH`, save as a user preset. Needs controller SM2-5.2.1-a250t.8+
+  (older firmware ignores L/R/F/B and runs a full `G1029 A`: stock/a250t.3 leave a raw mesh for a card step a print never
+  does). Without the token the output is byte-identical to 02.03.04.10. Dual bases: no line (controller refuses
+  `G1029 A` without the single 3DP head, `G1029.cpp:337-340`). Kits: BK 224, QS 215, QS+BK 209, Dual 190, Dual BK 184, Dual QS 175,
   Dual QS+BK 169 mm; QS/Dual add `bed_exclude_area`.
 - `fdm_a250_dual.json:25`: `change_filament_gcode` (T{next}, `M107 P`, `M109 T.. C3 W1`; header comment
   `; Change T<a> -> T<b> layer <n> z <z>`). On layer_num 1 (0-based = 2nd layer) with PLA/TPU it sets
@@ -158,6 +171,9 @@ PR-09 08/11/2026: 2c1c239 `render_start_gcode.py`; 3d8a9f8 footprint/nozzle/MVS-
 templates + rule SM2-GC-PURGE + tests (44); 6dba6d3 version 02.03.04.09+a250t (local, not pushed; gitlink not moved).
 Smart park 08/11/2026: df0f9fc flush/park point derived from the purge start + rule SM2-GC-PARK + `--moves` + tests (56);
 8ee9b52 version 02.03.04.10+a250t (local, not pushed; gitlink not moved).
+PR-23 08/11/2026: f77ad16 opt-in adaptive `G1029 A L R F B` after `M190 R` (single-head bases, `printer_notes` token
+`SM2_ADAPTIVE_MESH`) + renderer regex/`--adaptive` + rule SM2-GC-MESH + tests (71); b9210bb version 02.03.04.11+a250t
+(local, not pushed; gitlink not moved).
 Fix list:
 `../_snapmaker2-review/issues/snapmaker-profiles.md`. Details:
 `../_snapmaker2-review/integration/snapmaker-profiles.md`.
