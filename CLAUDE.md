@@ -14,15 +14,15 @@ community profiles and are the ones used for the owner's **A250T**.
 - No CI here; OrcaSlicer's `.github/workflows/check_profiles.yml` checks this bundle after syncing it.
 - No licence file, no README, no tags.
 
-## Build and test (macOS, verified 07/11/2026)
+## Build and test (macOS, verified 07/11/2026, re-run 08/11/2026 at e31798c)
 ```sh
 cd /Users/icaro/Documents/Projects/SnapMaker/snapmaker-profiles
 python3 -I scripts/validate_profiles.py            # RESULT: PASS (A250/A350 subset), exit 0
 python3 -I scripts/validate_profiles.py -v         # + geometry details
 python3 -I scripts/validate_profiles.py --strict   # exit 1: the 9 "other" (U1) issues below
-python3 -I scripts/test_validate_profiles.py       # 22 tests, OK (~1.3 s; copies the bundle to a temp dir)
+python3 -I -B scripts/test_validate_profiles.py    # 27 tests, OK (~2 s; copies the bundle to a temp dir; -B: no __pycache__)
 ```
-Current result (07/11/2026, 02.03.04.07+a250t): `0 A250/A350 error(s), 9 other-printer issue(s), 33 warning(s),
+Current result (08/11/2026, 02.03.04.08+a250t): `0 A250/A350 error(s), 9 other-printer issue(s), 33 warning(s),
 16 info`, plus a `RULES:` line with counts per rule ID. Other = upstream U1: 4x `default_print_profile` missing,
 1 duplicate `Snapmaker PLA SnapSpeed @U1 base`, 4x `SM2-GC-BEDTYPE` (U1 start G-code compares `curr_bed_type` with
 the UI label "Smooth PEI Plate", upstream PR2). Warnings (known, not fixed): `SM2-LIM-XY` x2 (XY 150 > firmware 120,
@@ -32,7 +32,9 @@ the plain printer of their family). The 16 INFO lines (printable_height 5 mm und
 intentional.
 SM2 rules (IDs in `validate_profiles.py` docstring, firmware facts as constants at the top): SM2-LIM-Z, SM2-LIM-XY,
 SM2-TEMP-MAX, SM2-RETRACT-E, SM2-DEF-COMPAT, SM2-COMPAT-KIT, SM2-GC-MCODE (allowlist from controller `gcode.cpp`),
-SM2-GC-DRIFT (A250 vs A350 twin templates), SM2-GC-BEDTYPE, SM2-GC-HOTBED, SM2-GC-FLUSH, SM2-GC-BEDMIN (Orca #552).
+SM2-GC-DRIFT (A250 vs A350 twin templates), SM2-GC-BEDTYPE, SM2-GC-HOTBED, SM2-GC-FLUSH, SM2-GC-BEDMIN (Orca #552),
+SM2-GC-PAUSE (every A250/A350 printer's `machine_pause_gcode` must resolve to a template with an `M600` line, PR-01).
+The `RULES:` line lists only rules with findings.
 Orca's CI checker must run on a scratch copy (it reads `<script>/../resources/profiles`): copy
 `OrcaSlicer/scripts/orca_extra_profile_check.py` to `<S>/scripts/`, `OrcaSlicer/resources/profiles/OrcaFilamentLibrary*`
 and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, then
@@ -43,7 +45,7 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
 ## Directory map
 | Path | Purpose |
 |---|---|
-| `Snapmaker.json` | Bundle index. `version` (line 3, `02.03.04.07+a250t`), `machine_model_list`, `process_list` (:84), `filament_list` (:534), `machine_list` (:1788). Each entry `{name, sub_path}`. |
+| `Snapmaker.json` | Bundle index. `version` (line 3, `02.03.04.08+a250t`), `machine_model_list`, `process_list` (:84), `filament_list` (:534), `machine_list` (:1788). Each entry `{name, sub_path}`. |
 | `Snapmaker/machine/` (119) | `Snapmaker <Model>.json` (type `machine_model`), `fdm_*` abstract bases, `Snapmaker <Model> (<n> nozzle).json` printers. |
 | `Snapmaker/process/` (112) | `fdm_process_*` bases; `0.xx <Quality> @Snapmaker[ J1| Artisan| U1] (<n> nozzle).json`. SM2 uses plain `@Snapmaker`. |
 | `Snapmaker/filament/` (316) | `fdm_filament_common`, `fdm_filament_<type>_category` bases; `Snapmaker <type>[ @Dual][ @U1][ @0.x nozzle]`, `Generic ...`, Polymaker. |
@@ -58,10 +60,14 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
 - Chain: `Snapmaker A250 (0.4 nozzle).json` -> `fdm_a250.json` -> `fdm_linear2.json` -> `fdm_common.json`.
   Dual: `fdm_a250_dual.json` -> `fdm_linear2_dual.json` -> `fdm_linear2.json`. Kits: `fdm_a250_qs|bk|qs_bk.json` ->
   `fdm_a250.json`; `fdm_a250_dual_qs|bk|qs_bk.json` -> `fdm_a250_dual.json`. Identical structure for A350.
-- `fdm_common.json`: `gcode_flavor marlin2`, `pause_gcode "M600 ;pause print"`, retraction 0.8 mm @45 mm/s, z_hop 0.4.
+- `fdm_common.json`: `gcode_flavor marlin2`, retraction 0.8 mm @45 mm/s, z_hop 0.4. Its `pause_gcode "M600 ;pause print"`
+  (:7) is a legacy key that Orca does not know and drops on load: it is unused. Orca's "Pause at layer" writes
+  `machine_pause_gcode` after `;PAUSE_PRINT` (OrcaSlicer `GCode.cpp:5011-5018`), which PR-01 sets to `M600` on
+  `fdm_a250`, `fdm_a350`, `fdm_a250_dual` and `fdm_a350_dual` (kit variants inherit; not on `fdm_linear2`/`fdm_common`,
+  which Artisan/J1 also use).
 - `fdm_linear2.json`: SM2 limits (accel X1100/Y1000/Z100 = firmware Z, BK bases no longer override Z; speed 150/150/40 mm/s, jerk 5/1/1/3), thumbnails `300x150`.
-- `fdm_a250.json:9-13`: `printable_area` 230x250, `printable_height` 230, `printer_notes PRINTER_MODEL_SNAPMAKER_A250`,
-  start/end G-code (`; Update: 20250313`). Start G-code (all 4 bases): flush temp
+- `fdm_a250.json:9-14`: `printable_area` 230x250, `printable_height` 230, `printer_notes PRINTER_MODEL_SNAPMAKER_A250`,
+  `machine_pause_gcode M600` (:12), start/end G-code (`; Update: 20250313`). Start G-code (all 4 bases): flush temp
   `min(<275 single|290 Dual>, min(nozzle_temperature_range_high, max(250, first_layer + 15)))`; hot-bed +0.06 mm
   (bed >= 90 C) applied as `G0 Z1.66` + `G92 Z1.6` (`; SM2_HOTBED_COMP` comment), never at Z0.06 near the bed. Kits: BK 224, QS 215, QS+BK 209, Dual 190, Dual BK 184, Dual QS 175,
   Dual QS+BK 169 mm; QS/Dual add `bed_exclude_area`.
@@ -122,7 +128,9 @@ f0d147d version 02.03.04.06+a250t; 0655774 restore CRLF in `fdm_idex.json`; 0f53
 Fix pass 07/11/2026: 2a66478 SM2 validator rules; 019985e Z accel 100 (SP-02); df91431 hot-bed offset at Z1.6 (SP-01);
 8b44414 flush temp cap (SP-03); b24a728 Dual toolchange bed max() (Orca #552); 423eed9 Dual idle preheat behind Ooze
 prevention (SP-06); 8923d1e Snapmaker PET 275 (SP-04); 1421de3 Dual default `Snapmaker PLA @Dual` (SP-05); f3b89cd
-A350 Dual purge E12; a8d00ff tests; 440f22a version 02.03.04.07+a250t. Fix list:
+A350 Dual purge E12; a8d00ff tests; 440f22a version 02.03.04.07+a250t; 2b71728 CLAUDE.md.
+PR-01 08/11/2026: 12a494f `machine_pause_gcode` M600 on the four SM2 bases + rule SM2-GC-PAUSE + tests (27); e31798c
+version 02.03.04.08+a250t (pushed to the icaroNZ fork). Fix list:
 `../_snapmaker2-review/issues/snapmaker-profiles.md`. Details:
 `../_snapmaker2-review/integration/snapmaker-profiles.md`.
 
@@ -130,7 +138,7 @@ A350 Dual purge E12; a8d00ff tests; 440f22a version 02.03.04.07+a250t. Fix list:
 Full map: `../.claude/knowledge/DEPENDENCIES.md`; facts: `../.claude/knowledge/repos/snapmaker-profiles.json`;
 specialist agent: `sm-profiles`.
 - **OrcaSlicer** (sm-orca): `.gitmodules` `submodules/Profiles` -> `https://github.com/icaroNZ/snapmaker-profiles.git`
-  branch `a250t/main`, gitlink 0655774; `CMakeLists.txt:76-93` + `cmake/SyncSnapmakerProfiles.cmake` (requires
+  branch `a250t/main`, gitlink e31798c (moved in OrcaSlicer 8df381cf21 on 08/11/2026, owner's OK); `CMakeLists.txt:76-93` + `cmake/SyncSnapmakerProfiles.cmake` (requires
   `Snapmaker.json` + 3 rule files, mirrors machine/filament/process); `check_profiles.yml`; `PresetBundle.cpp`
   (`SM_BUNDLE = "Snapmaker"`), `PresetUpdater.cpp:919,1349-1368,1407-1413` (version regex, rule-file deploy,
   resource-vs-installed compare); rule readers `AllowlistManager.cpp:15`, `FilamentColorLibrary.cpp:111`,
