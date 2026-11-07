@@ -9,7 +9,8 @@ community profiles and are the ones used for the owner's **A250T**.
 
 ## Tech stack
 - Pure JSON data (no build). Most preset files use **CRLF** line endings; some start with a UTF-8 BOM upstream.
-- `scripts/validate_profiles.py` - Python 3 stdlib-only static validator (added on a250t).
+- `scripts/validate_profiles.py` - Python 3 stdlib-only static validator (added on a250t), with SM2 content rules.
+- `scripts/test_validate_profiles.py` - stdlib `unittest` suite for the validator and the SM2 preset fixes.
 - No CI here; OrcaSlicer's `.github/workflows/check_profiles.yml` checks this bundle after syncing it.
 - No licence file, no README, no tags.
 
@@ -18,10 +19,20 @@ community profiles and are the ones used for the owner's **A250T**.
 cd /Users/icaro/Documents/Projects/SnapMaker/snapmaker-profiles
 python3 -I scripts/validate_profiles.py            # RESULT: PASS (A250/A350 subset), exit 0
 python3 -I scripts/validate_profiles.py -v         # + geometry details
-python3 -I scripts/validate_profiles.py --strict   # exit 1: 4 U1 default_print_profile + 1 duplicate (upstream issues)
+python3 -I scripts/validate_profiles.py --strict   # exit 1: the 9 "other" (U1) issues below
+python3 -I scripts/test_validate_profiles.py       # 22 tests, OK (~1.3 s; copies the bundle to a temp dir)
 ```
-Current result: `0 A250/A350 error(s), 5 other-printer issue(s), 0 warning(s), 16 info`. The 16 INFO lines
-(printable_height 5 mm under spec, lower for kits) are intentional.
+Current result (07/11/2026, 02.03.04.07+a250t): `0 A250/A350 error(s), 9 other-printer issue(s), 33 warning(s),
+16 info`, plus a `RULES:` line with counts per rule ID. Other = upstream U1: 4x `default_print_profile` missing,
+1 duplicate `Snapmaker PLA SnapSpeed @U1 base`, 4x `SM2-GC-BEDTYPE` (U1 start G-code compares `curr_bed_type` with
+the UI label "Smooth PEI Plate", upstream PR2). Warnings (known, not fixed): `SM2-LIM-XY` x2 (XY 150 > firmware 120,
+needs T-module check), `SM2-RETRACT-E` x25 (filament retraction 60 > E max 45; firmware caps it), `SM2-TEMP-MAX` x4
+(ABS/ASA single `range_high` 280 > 275; nothing prints at it), `SM2-COMPAT-KIT` x2 (PVA @0.2 / PET @Dual 0.8 list only
+the plain printer of their family). The 16 INFO lines (printable_height 5 mm under spec, lower for kits) are
+intentional.
+SM2 rules (IDs in `validate_profiles.py` docstring, firmware facts as constants at the top): SM2-LIM-Z, SM2-LIM-XY,
+SM2-TEMP-MAX, SM2-RETRACT-E, SM2-DEF-COMPAT, SM2-COMPAT-KIT, SM2-GC-MCODE (allowlist from controller `gcode.cpp`),
+SM2-GC-DRIFT (A250 vs A350 twin templates), SM2-GC-BEDTYPE, SM2-GC-HOTBED, SM2-GC-FLUSH, SM2-GC-BEDMIN (Orca #552).
 Orca's CI checker must run on a scratch copy (it reads `<script>/../resources/profiles`): copy
 `OrcaSlicer/scripts/orca_extra_profile_check.py` to `<S>/scripts/`, `OrcaSlicer/resources/profiles/OrcaFilamentLibrary*`
 and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, then
@@ -32,7 +43,7 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
 ## Directory map
 | Path | Purpose |
 |---|---|
-| `Snapmaker.json` | Bundle index. `version` (line 3, `02.03.04.06+a250t`), `machine_model_list`, `process_list` (:84), `filament_list` (:534), `machine_list` (:1788). Each entry `{name, sub_path}`. |
+| `Snapmaker.json` | Bundle index. `version` (line 3, `02.03.04.07+a250t`), `machine_model_list`, `process_list` (:84), `filament_list` (:534), `machine_list` (:1788). Each entry `{name, sub_path}`. |
 | `Snapmaker/machine/` (119) | `Snapmaker <Model>.json` (type `machine_model`), `fdm_*` abstract bases, `Snapmaker <Model> (<n> nozzle).json` printers. |
 | `Snapmaker/process/` (112) | `fdm_process_*` bases; `0.xx <Quality> @Snapmaker[ J1| Artisan| U1] (<n> nozzle).json`. SM2 uses plain `@Snapmaker`. |
 | `Snapmaker/filament/` (316) | `fdm_filament_common`, `fdm_filament_<type>_category` bases; `Snapmaker <type>[ @Dual][ @U1][ @0.x nozzle]`, `Generic ...`, Polymaker. |
@@ -41,17 +52,24 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
 | `Snapmaker/filament/filament_hot_bed_nozzles.json` | Rule file: plate (btPEI, btGESP, ...) / nozzle restrictions per filament. |
 | `Snapmaker/filament/filaments_colours.json` | Rule file: official colour SKUs. |
 | `scripts/validate_profiles.py` | Validator (a250t). |
+| `scripts/test_validate_profiles.py` | Validator/preset tests (a250t). |
 
 ## Key files for the Snapmaker 2.0
 - Chain: `Snapmaker A250 (0.4 nozzle).json` -> `fdm_a250.json` -> `fdm_linear2.json` -> `fdm_common.json`.
   Dual: `fdm_a250_dual.json` -> `fdm_linear2_dual.json` -> `fdm_linear2.json`. Kits: `fdm_a250_qs|bk|qs_bk.json` ->
   `fdm_a250.json`; `fdm_a250_dual_qs|bk|qs_bk.json` -> `fdm_a250_dual.json`. Identical structure for A350.
 - `fdm_common.json`: `gcode_flavor marlin2`, `pause_gcode "M600 ;pause print"`, retraction 0.8 mm @45 mm/s, z_hop 0.4.
-- `fdm_linear2.json`: SM2 limits (accel X1100/Y1000/Z500, speed 150/150/40 mm/s, jerk 5/1/1/3), thumbnails `300x150`.
+- `fdm_linear2.json`: SM2 limits (accel X1100/Y1000/Z100 = firmware Z, BK bases no longer override Z; speed 150/150/40 mm/s, jerk 5/1/1/3), thumbnails `300x150`.
 - `fdm_a250.json:9-13`: `printable_area` 230x250, `printable_height` 230, `printer_notes PRINTER_MODEL_SNAPMAKER_A250`,
-  start/end G-code (`; Update: 20250313`). Kits: BK 224, QS 215, QS+BK 209, Dual 190, Dual BK 184, Dual QS 175,
+  start/end G-code (`; Update: 20250313`). Start G-code (all 4 bases): flush temp
+  `min(<275 single|290 Dual>, min(nozzle_temperature_range_high, max(250, first_layer + 15)))`; hot-bed +0.06 mm
+  (bed >= 90 C) applied as `G0 Z1.66` + `G92 Z1.6` (`; SM2_HOTBED_COMP` comment), never at Z0.06 near the bed. Kits: BK 224, QS 215, QS+BK 209, Dual 190, Dual BK 184, Dual QS 175,
   Dual QS+BK 169 mm; QS/Dual add `bed_exclude_area`.
-- `fdm_a250_dual.json:25`: `change_filament_gcode` (T{next}, `M107 P`, `M109 T.. C3 W1`).
+- `fdm_a250_dual.json:25`: `change_filament_gcode` (T{next}, `M107 P`, `M109 T.. C3 W1`; header comment
+  `; Change T<a> -> T<b> layer <n> z <z>`). On layer_num 1 (0-based = 2nd layer) with PLA/TPU it sets
+  `M140 S{max(bed a, bed b)}` (was min(), Orca #552). Dual start G-code preheats the idle nozzle to
+  first layer + `standby_temperature_delta` only when the process option Ooze prevention is on; Orca then also emits
+  the standby `M104 ... ;cooldown` at toolchanges. Dual `default_filament_profile` = `Snapmaker PLA @Dual` x2.
 - Model file `Snapmaker A250.json`: `url https://github.com/macdylan`, nozzles `0.2;0.4;0.6;0.8`,
   `bed_model "Snapmaker A250_bed.stl"` (asset stored in OrcaSlicer, not here).
 - Process: `fdm_process_common.json` + 7 shared 0.4 mm processes (default `0.16 Optimal @Snapmaker (0.4 nozzle)`);
@@ -72,7 +90,8 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
   bot commits from "ProfilesCMS" (branch `origin/02.03.05.00`) carry `ProfilesCMS-Operation:` trailers.
 - G-code strings are single JSON lines with `\n`, Orca placeholders `[x]` / `{expr}`; macdylan `SMFix` marker block at
   the end of `machine_end_gcode` must stay.
-- Validator: Python `logging` (`ERROR [A250/A350]`, `WARNING [other]`, `INFO [info]`), summary in `finish()`.
+- Validator: Python `logging` (`ERROR [A250/A350]`, `WARNING [other]`, `WARNING [warn]`, `INFO [info]`), the rule
+  ID right after the tag (e.g. `ERROR [A250/A350] SM2-LIM-Z ...`), per-rule counts and summary in `finish()`.
 
 ## How to extend
 - **Add/change a filament or process**: copy a sibling, keep only differing keys, set `compatible_printers` to exact
@@ -99,7 +118,12 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
 17bf0bb validator; c7757d9 SnapSpeed `filament_density` 1.25; 252a7a2 re-index `0.24 Standard @Snapmaker (0.8 nozzle)`
 (default of all 16 SM2 0.8 mm printers); 3ff1148 version 02.03.04.05+a250t; 497718b J1 `default_filament_profile`
 -> `Snapmaker PLA @J1`/`Snapmaker PETG @J1`, BOM removed from `fdm_process_common.json` and one U1 process;
-f0d147d version 02.03.04.06+a250t; 0655774 restore CRLF in `fdm_idex.json`; 0f53633 restore CRLF in `Snapmaker.json`. Details:
+f0d147d version 02.03.04.06+a250t; 0655774 restore CRLF in `fdm_idex.json`; 0f53633 restore CRLF in `Snapmaker.json`.
+Fix pass 07/11/2026: 2a66478 SM2 validator rules; 019985e Z accel 100 (SP-02); df91431 hot-bed offset at Z1.6 (SP-01);
+8b44414 flush temp cap (SP-03); b24a728 Dual toolchange bed max() (Orca #552); 423eed9 Dual idle preheat behind Ooze
+prevention (SP-06); 8923d1e Snapmaker PET 275 (SP-04); 1421de3 Dual default `Snapmaker PLA @Dual` (SP-05); f3b89cd
+A350 Dual purge E12; a8d00ff tests; 440f22a version 02.03.04.07+a250t. Fix list:
+`../_snapmaker2-review/issues/snapmaker-profiles.md`. Details:
 `../_snapmaker2-review/integration/snapmaker-profiles.md`.
 
 ## Cross-repo interfaces
