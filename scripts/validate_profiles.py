@@ -32,8 +32,8 @@ on) when it loads ``Snapmaker.json`` in ``PresetBundle::load_vendor_configs_from
   SM2-GC-DRIFT  A250 and A350 twin templates only differ in bed coordinates
   SM2-GC-BEDTYPE curr_bed_type comparisons use a stored BedType value
   SM2-GC-HOTBED no Z move below 1 mm between G28 and the first XY move
-  SM2-GC-FLUSH  start flush temperature is capped at nozzle_temperature_range_high
-                (and 275 on single-head printers)
+  SM2-GC-FLUSH  start flush temperature (M104/M109 on first layer + 15) is capped at
+                nozzle_temperature_range_high (and 275 on single-head printers)
   SM2-GC-BEDMIN change_filament_gcode never lowers the bed with min() (Orca #552)
   SM2-GC-PAUSE  machine_pause_gcode resolves to a template with an M600 line (Orca's
                 "Pause" item writes only this key after ;PAUSE_PRINT; an empty value
@@ -55,6 +55,15 @@ on) when it loads ``Snapmaker.json`` in ``PresetBundle::load_vendor_configs_from
                 M190 R and before every G0/G1, whose region is Orca's adaptive_bed_mesh_min/max clamped to the bed,
                 and nothing else changes; Dual printers emit no G1029 (the controller refuses G1029 A without the
                 single 3DP head, G1029.cpp:337-340)
+  SM2-GC-SCREENTEMP (a250t F1) layer_change_gcode, rendered for layers 0-3: on layer_num 1 only (Orca's layer-2
+                temperature block follows it, GCode.cpp:5394 before :5494) it writes each M140 twice with Orca's
+                layer-2 bed value (single head: also M104 twice with nozzle_temperature), so the stock touchscreen's
+                one-shot rewrite of the first M104/M140 after a drawer open (OnAirGcodeModifier) hits the copy;
+                nothing on other layers (a per-layer re-send would undo live temperature changes from the screen)
+                and never M109/M190
+  SM2-CFG       (a250t F6/F8/F11) host_type is snapmaker2 ("Snapmaker 2.0 (HTTP)"), disable_m73 is on (the
+                controller has no M73), machine_max_junction_deviation is within the controller's M205 J range
+                0.01-0.3 (Orca writes M205 J only when it is > 0, GCodeWriter.cpp:322)
 
 Findings that involve the Snapmaker 2.0 A250/A350 presets (directly, or as a
 base of them) are ERRORs and make the script exit with status 1. Findings on
@@ -117,7 +126,11 @@ GCODE_KEYS = ("machine_start_gcode", "machine_end_gcode", "change_filament_gcode
               "time_lapse_gcode", "wrapping_detection_gcode")
 SM2_TWINS = (("fdm_a250", "fdm_a350"), ("fdm_a250_dual", "fdm_a350_dual"))
 DRIFT_KEYS = ("machine_start_gcode", "machine_end_gcode", "change_filament_gcode", "before_layer_change_gcode",
-              "machine_pause_gcode")
+              "machine_pause_gcode", "layer_change_gcode")
+# a250t F6/F8/F11 (SM2-CFG): OrcaSlicer PrintConfig.cpp host_type enum value of "Snapmaker 2.0 (HTTP)"; controller
+# M205 J range (Marlin/src/gcode/config/M200-M205.cpp:259, else "?J out of range"); JD of Configuration.h:757.
+SM2_HOST_TYPE = "snapmaker2"
+FW_JD_RANGE = (0.01, 0.3)
 # SM2-GC-PURGE (PR-09): placeholders the purge must use (Orca GCode.cpp:3040-3042 first_layer_print_*, PrintConfig
 # nozzle_diameter / filament_max_volumetric_speed coFloats), the comment it writes, and its limits.
 PURGE_PLACEHOLDERS = ("first_layer_print_min", "first_layer_print_max", "nozzle_diameter[",
@@ -276,9 +289,12 @@ def rule_gc_hotbed(start):
 
 
 def rule_gc_flush(start, single):
+    # a250t F3: the single-head flush has no 250 floor any more, so flush lines are found by their
+    # "first layer + 15" term instead of by "max(250" (which would leave them unchecked).
     out = []
     for code in gcode_code_lines(start):
-        if re.match(r"M10[49]\b", code) and "max(250" in code.replace(" ", ""):
+        flat = code.replace(" ", "")
+        if re.match(r"M10[49]\b", code) and ("max(250" in flat or re.search(r"nozzle_temperature_initial_layer\[.*\]\+15\b", flat)):
             if "nozzle_temperature_range_high" not in code:
                 out.append(("SM2-GC-FLUSH", "flush %r ignores nozzle_temperature_range_high" % code[:60]))
             if single and "min(%d" % HOTEND_MAX_SINGLE not in code.replace(" ", ""):
@@ -307,6 +323,71 @@ def rule_gc_pause(text):
         return [("SM2-GC-PAUSE", "%r has no M600 line; M600 is the G-code that triggers the SM2's"
                                  " screen pause/runout flow (M600.cpp:163-174)" % "\n".join(lines)[:60])]
     return []
+
+
+def _render(text, variables, current_extruder=0):
+    """Rendered code lines (comments stripped) of an Orca template, or a RenderError message."""
+    try:
+        out, _ = renderer().render(text, variables, current_extruder)
+    except renderer().RenderError as exc:
+        return None, str(exc)
+    return gcode_code_lines(out), None
+
+
+def rule_gc_screentemp(text, dual):
+    """SM2-GC-SCREENTEMP (a250t F1): see the module docstring. Investigation:
+    _snapmaker2-review/investigations/screen-temp-override-165.md (screen OnAirGcodeModifier.java:373-411,
+    BatchPrintController.java:427-432)."""
+    if not str(text or "").strip():
+        return [("SM2-GC-SCREENTEMP", "layer_change_gcode is empty: nothing absorbs the touchscreen's rewrite of"
+                                      " Orca's layer-2 M104/M140 (165/70 C after a print-drawer open, a250t F1)")]
+    out = []
+    # sample job: T0 215/60, T1 225/70 (Dual: Orca's layer-2 bed = max over used extruders, GCode.cpp:4098)
+    cases = [(0, [True, False])] + ([(0, [True, True]), (1, [False, True])] if dual else [])
+    for ext, used in cases:
+        for layer in (0, 1, 2, 3):
+            v = {"layer_num": layer, "layer_z": 0.2 * (layer + 1), "current_extruder": ext,
+                 "nozzle_temperature": [215, 225], "nozzle_temperature_initial_layer": [220, 230],
+                 "bed_temperature": [60, 70], "bed_temperature_initial_layer_single": 65,
+                 "is_extruder_used": used}
+            lines, err = _render(text, v, ext)
+            if err:
+                return [("SM2-GC-SCREENTEMP", "layer_change_gcode does not render: %s" % err)]
+            temps = [c for c in lines if re.match(r"M(104|109|140|190)\b", c)]
+            where = "T%d used=%s layer_num %d" % (ext, used, layer)
+            if any(re.match(r"M(109|190)\b", c) for c in temps):
+                out.append(("SM2-GC-SCREENTEMP", "%s: waits (M109/M190) in per-layer G-code: %r" % (where, temps)))
+            if layer != 1:
+                if temps:
+                    out.append(("SM2-GC-SCREENTEMP", "%s: temperature lines outside layer_num 1 would undo live"
+                                                     " temperature changes from the screen: %r" % (where, temps)))
+                continue
+            bed = max(b for b, u in zip([60, 70], used) if u) if dual else 60
+            want = ["M140 S%d" % bed] * 2 + ([] if dual else ["M104 S%d" % [215, 225][ext]] * 2)
+            got = sorted(re.sub(r"\s+", " ", c).strip() for c in temps if re.match(r"M1[04][04]\b", c))
+            if sorted(want) != got:
+                out.append(("SM2-GC-SCREENTEMP", "%s: expected each of %s twice (sacrificial copy + real line with"
+                                                 " Orca's layer-2 value), got %r" % (where, sorted(set(want)), got)))
+    return out
+
+
+
+def rule_cfg(cfg):
+    """SM2-CFG (a250t F6/F8/F11): (key, finding) pairs."""
+    out = []
+    if str(cfg.get("host_type", "")).strip() != SM2_HOST_TYPE:
+        out.append(("host_type", ("SM2-CFG", "host_type=%r, expected %r (Snapmaker 2.0 (HTTP), a250t F6)"
+                                  % (cfg.get("host_type"), SM2_HOST_TYPE))))
+    if str(cfg.get("disable_m73", "0")).strip() not in ("1", "true"):
+        out.append(("disable_m73", ("SM2-CFG", "disable_m73 is off: the controller answers every M73 with 'Unknown"
+                                    " command' (LCD_SET_PROGRESS_MANUALLY off, a250t F11)")))
+    jd = first_float(cfg.get("machine_max_junction_deviation"))
+    if jd is None or not FW_JD_RANGE[0] <= jd <= FW_JD_RANGE[1]:
+        out.append(("machine_max_junction_deviation",
+                    ("SM2-CFG", "machine_max_junction_deviation=%r: 0 makes Orca write only M205 X/Y, which the"
+                                " junction-deviation firmware ignores; the controller accepts M205 J %g-%g (a250t F8)"
+                     % (cfg.get("machine_max_junction_deviation"), FW_JD_RANGE[0], FW_JD_RANGE[1]))))
+    return out
 
 
 def _load_renderer():
@@ -957,6 +1038,10 @@ def check_sm2_rules(presets, resolve, machines_inst, sm2_scope, report):
         # outside the GCODE_KEYS loop: that loop skips empty values, and a missing pause G-code is the bug
         emit(rule_gc_pause(cfg.get("machine_pause_gcode")),
              "%s:machine_pause_gcode" % defined_in("machine", chain, "machine_pause_gcode"))
+        emit(rule_gc_screentemp(cfg.get("layer_change_gcode"), dual=not single),  # a250t F1
+             "%s:layer_change_gcode" % defined_in("machine", chain, "layer_change_gcode"))
+        for key, finding in rule_cfg(cfg):  # a250t F6/F8/F11
+            emit([finding], "%s:%s" % (defined_in("machine", chain, key), key))
         for ptype, key in (("filament", "default_filament_profile"), ("process", "default_print_profile")):
             for dflt in as_list(cfg.get(key)):
                 if not dflt or ("process" if ptype == "process" else "filament", dflt) not in presets:

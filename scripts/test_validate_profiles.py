@@ -68,6 +68,44 @@ class RuleUnitTests(unittest.TestCase):
         dual = "M109 S{min(nozzle_temperature_range_high[0], min(290, max(250, t + 15)))} C2 W1"
         self.assertEqual(vp.rule_gc_flush(dual, single=False), [])
         self.assertEqual(len(vp.rule_gc_flush(dual, single=True)), 1)
+        # a250t F3: single flush without the 250 floor is still found and checked
+        f3 = "M104 S{min(275, min(nozzle_temperature_range_high[0], nozzle_temperature_initial_layer[0] + 15))}"
+        self.assertEqual(vp.rule_gc_flush(f3, single=True), [])
+        self.assertEqual(len(vp.rule_gc_flush("M104 S{min(275, nozzle_temperature_initial_layer[0] + 15)}",
+                                              single=True)), 1)
+        self.assertEqual(len(vp.rule_gc_flush("M104 S{nozzle_temperature_initial_layer[0] + 15}", single=True)), 2)
+
+    def test_screentemp_rule(self):
+        """a250t F1: sacrificial M104/M140 copies on layer_num 1 only, real values, no waits."""
+        single = ("{if layer_num == 1}M104 S{nozzle_temperature[current_extruder]} ; sacrificial\n"
+                  "M104 S{nozzle_temperature[current_extruder]}\nM140 S{bed_temperature[current_extruder]} ; s\n"
+                  "M140 S{bed_temperature[current_extruder]}\n{endif}")
+        self.assertEqual(vp.rule_gc_screentemp(single, dual=False), [])
+        self.assertEqual([r for r, _ in vp.rule_gc_screentemp("", dual=False)], ["SM2-GC-SCREENTEMP"])
+        every_layer = single.replace("{if layer_num == 1}", "{if true}")
+        self.assertIn("SM2-GC-SCREENTEMP", [r for r, _ in vp.rule_gc_screentemp(every_layer, dual=False)])
+        no_copy = single.replace("M104 S{nozzle_temperature[current_extruder]} ; sacrificial\n", "")
+        self.assertIn("SM2-GC-SCREENTEMP", [r for r, _ in vp.rule_gc_screentemp(no_copy, dual=False)])
+        wrong = single.replace("bed_temperature[", "nozzle_temperature[")
+        self.assertIn("SM2-GC-SCREENTEMP", [r for r, _ in vp.rule_gc_screentemp(wrong, dual=False)])
+        wait = single.replace("{endif}", "M109 S{nozzle_temperature[current_extruder]}\n{endif}")
+        self.assertIn("SM2-GC-SCREENTEMP", [r for r, _ in vp.rule_gc_screentemp(wait, dual=False)])
+        bed = "max(is_extruder_used[0] ? bed_temperature[0] : 0, is_extruder_used[1] ? bed_temperature[1] : 0)"
+        dual = "{if layer_num == 1}M140 S{%s} ; s\nM140 S{%s}\n{endif}" % (bed, bed)
+        self.assertEqual(vp.rule_gc_screentemp(dual, dual=True), [])
+        cur_only = dual.replace(bed, "bed_temperature[current_extruder]")  # not Orca's max over used extruders
+        self.assertIn("SM2-GC-SCREENTEMP", [r for r, _ in vp.rule_gc_screentemp(cur_only, dual=True)])
+
+    def test_cfg_rule(self):
+        """a250t F6/F8/F11."""
+        good = {"host_type": "snapmaker2", "disable_m73": "1", "machine_max_junction_deviation": ["0.02"]}
+        self.assertEqual(vp.rule_cfg(good), [])
+        for key, val in (("host_type", "octoprint"), ("disable_m73", "0"), ("machine_max_junction_deviation", ["0"]),
+                         ("machine_max_junction_deviation", ["0.5"])):
+            bad = dict(good, **{key: val})
+            self.assertEqual([k for k, _ in vp.rule_cfg(bad)], [key], (key, val))
+        self.assertEqual(sorted(k for k, _ in vp.rule_cfg({})),
+                         ["disable_m73", "host_type", "machine_max_junction_deviation"])
 
     def test_bedmin_issue_552(self):
         self.assertEqual([r for r, _ in vp.rule_gc_bedmin(
@@ -418,8 +456,38 @@ class FixedTemplateTests(unittest.TestCase):
     def test_pause_gcode(self):
         """PR-01: Orca's Pause at layer writes machine_pause_gcode; M600 is the SM2 runout pause (single and Dual)."""
         for base in self.BASES:
-            self.assertEqual(template(base, "machine_pause_gcode"), "M600", base)
-            self.assertEqual(vp.rule_gc_pause(template(base, "machine_pause_gcode")), [], base)
+            pause = template(base, "machine_pause_gcode")
+            self.assertEqual(pause, "M600", base)  # a250t F10 is fixed in the controller (a250t.12), not here
+            self.assertEqual(vp.rule_gc_pause(pause), [], base)
+
+    def test_a250t_f1_f3_f6_f8_f11(self):
+        presets = rsg.load_machine_presets(ROOT)
+        for base in self.BASES:
+            dual = "dual" in base
+            start = template(base, "machine_start_gcode")
+            # F3: single head flushes at first layer + 15 (no 250 floor); Dual keeps Snapmaker's floor
+            self.assertEqual("max(250" in start, dual, base)
+            self.assertEqual(vp.rule_gc_screentemp(template(base, "layer_change_gcode"), dual), [], base)
+            cfg = rsg.resolve_machine(presets, base[:-5])
+            self.assertEqual(vp.rule_cfg(cfg), [], base)
+            self.assertEqual(cfg["host_type"], "snapmaker2")
+            self.assertEqual(cfg["machine_max_junction_deviation"], ["0.02"])
+        # every A250/A350 printer (kits, nozzles) inherits them
+        names = [n for n in presets if vp.SM2_PRINTER_RE.match(n)]
+        self.assertGreater(len(names), 60)
+        for name in names:
+            cfg = rsg.resolve_machine(presets, name)
+            self.assertEqual(vp.rule_cfg(cfg), [], name)
+            self.assertIn("layer_change_gcode", cfg, name)
+
+    def test_f3_flush_render(self):
+        """a250t F3: PLA (first layer 210, range_high 240) flushes at 225 on single, 240 on Dual (250 floor, range_high cap)."""
+        for printer, want in (("Snapmaker A250 (0.4 nozzle)", 225), ("Snapmaker A350 (0.4 nozzle)", 225),
+                              ("Snapmaker A250 Dual (0.4 nozzle)", 240)):
+            cfg = rsg.resolve_machine(rsg.load_machine_presets(ROOT), printer)
+            text, _ = rsg.render(cfg["machine_start_gcode"], rsg.sample_variables(cfg, (90, 100, 140, 150)))
+            flush = [ln for ln in text.splitlines() if ln.startswith("M109") and "C2 W1" in ln]
+            self.assertEqual(flush, ["M109 S%d C2 W1" % want], printer)
 
     def test_dual_toolchange(self):
         for base in ("fdm_a250_dual.json", "fdm_a350_dual.json"):
@@ -557,7 +625,38 @@ class BundleTests(unittest.TestCase):
 
     def test_pr01_pause_missing_regression(self):
         # Dual base without the key: it then resolves to nothing (fdm_linear2_dual/fdm_linear2/fdm_common lack it)
-        self._mutated("machine/fdm_a250_dual.json", b'  "machine_pause_gcode": "M600",\r\n', b"", "SM2-GC-PAUSE")
+        path = os.path.join(MACHINE, "fdm_a250_dual.json")
+        with open(path, "rb") as fh:
+            line = next(ln for ln in fh.read().split(b"\r\n") if ln.startswith(b'  "machine_pause_gcode": '))
+        self._mutated("machine/fdm_a250_dual.json", line + b"\r\n", b"", "SM2-GC-PAUSE")
+
+    def test_f1_every_layer_regression(self):  # would undo live temperature changes from the screen
+        self._mutated("machine/fdm_a250.json", b'"layer_change_gcode": "{if layer_num == 1}',
+                      b'"layer_change_gcode": "{if layer_num >= 1}', "SM2-GC-SCREENTEMP")
+
+    def test_f1_missing_regression(self):
+        self._mutated("machine/fdm_a350_dual.json", b'"layer_change_gcode": "{if layer_num == 1}',
+                      b'"layer_change_gcode": "{if layer_num == 99}', "SM2-GC-SCREENTEMP")
+
+    def test_f1_drift_regression(self):
+        self._mutated("machine/fdm_a350.json", b"M104 S{nozzle_temperature[current_extruder]}\\n{endif}",
+                      b"M104 S{nozzle_temperature[current_extruder] + 5}\\n{endif}", "SM2-GC-DRIFT")
+
+    def test_f3_flush_uncapped_regression(self):
+        self._mutated("machine/fdm_a250.json",
+                      b"M104 S{min(275, min(nozzle_temperature_range_high[(initial_extruder % 2 == 0 ? min(initial_extruder"
+                      b" + initial_extruder, 63) : max(initial_extruder - (1-initial_extruder), 0))], ",
+                      b"M104 S{min(275, min(999, ", "SM2-GC-FLUSH")
+
+    def test_f6_host_type_regression(self):
+        self._mutated("machine/fdm_a350.json", b'"host_type": "snapmaker2"', b'"host_type": "octoprint"', "SM2-CFG")
+
+    def test_f8_junction_deviation_regression(self):
+        self._mutated("machine/fdm_a250_dual.json", b'"machine_max_junction_deviation": [\r\n    "0.02"',
+                      b'"machine_max_junction_deviation": [\r\n    "0"', "SM2-CFG")
+
+    def test_f11_m73_regression(self):
+        self._mutated("machine/fdm_a250.json", b'"disable_m73": "1"', b'"disable_m73": "0"', "SM2-CFG")
 
     def test_pr01_pause_drift_regression(self):
         self._mutated("machine/fdm_a350.json", b'"machine_pause_gcode": "M600"', b'"machine_pause_gcode": "M600\\nM0"',

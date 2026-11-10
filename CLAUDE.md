@@ -21,15 +21,15 @@ community profiles and are the ones used for the owner's **A250T**.
 - No CI here; OrcaSlicer's `.github/workflows/check_profiles.yml` checks this bundle after syncing it.
 - No licence file, no README, no tags.
 
-## Build and test (macOS, verified 07/11/2026, re-run 08/11/2026 at b9210bb)
+## Build and test (macOS, verified 07/11/2026, re-run 10/11/2026 on uncommitted 02.03.04.12+a250t)
 ```sh
 cd /Users/icaro/Documents/Projects/SnapMaker/snapmaker-profiles
 python3 -I scripts/validate_profiles.py            # RESULT: PASS (A250/A350 subset), exit 0
 python3 -I scripts/validate_profiles.py -v         # + geometry details
 python3 -I scripts/validate_profiles.py --strict   # exit 1: the 9 "other" (U1) issues below
-python3 -I -B scripts/test_validate_profiles.py    # 71 tests, OK (~3 s; copies the bundle to a temp dir; -B: no __pycache__)
+python3 -I -B scripts/test_validate_profiles.py    # 82 tests, OK (~3 s; copies the bundle to a temp dir; -B: no __pycache__)
 ```
-Current result (08/11/2026, 02.03.04.11+a250t): `0 A250/A350 error(s), 9 other-printer issue(s), 33 warning(s),
+Current result (10/11/2026, 02.03.04.12+a250t, uncommitted): `0 A250/A350 error(s), 9 other-printer issue(s), 33 warning(s),
 16 info`, plus a `RULES:` line with counts per rule ID. Other = upstream U1: 4x `default_print_profile` missing,
 1 duplicate `Snapmaker PLA SnapSpeed @U1 base`, 4x `SM2-GC-BEDTYPE` (U1 start G-code compares `curr_bed_type` with
 the UI label "Smooth PEI Plate", upstream PR2). Warnings (known, not fixed): `SM2-LIM-XY` x2 (XY 150 > firmware 120,
@@ -52,6 +52,9 @@ SM2-GC-MESH (PR-23, same footprints at `adaptive_bed_mesh_margin` 0 and 5 mm: no
 contains `SM2_ADAPTIVE_MESH`; with it single-head printers emit exactly one `G1029 A L.. R.. F.. B..` (no H/K/P) after
 `G28` and `M190 R` and before every G0/G1, region = `adaptive_bed_mesh_min/max` clamped to the bed, nothing else changes;
 Dual printers never emit `G1029`).
+Machine-test fixes (10/11/2026): SM2-GC-SCREENTEMP (F1, `layer_change_gcode` writes sacrificial + real M140 (single:
+also M104) on `layer_num == 1` only, no waits; Orca's own layer-2 M104/M140 still follow), SM2-CFG (F6 `host_type snapmaker2`, F11
+`disable_m73 1`, F8 `machine_max_junction_deviation` in 0.01-0.3); SM2-GC-FLUSH finds flush lines by `first_layer + 15`.
 The `RULES:` line lists only rules with findings.
 Orca's CI checker must run on a scratch copy (it reads `<script>/../resources/profiles`): copy
 `OrcaSlicer/scripts/orca_extra_profile_check.py` to `<S>/scripts/`, `OrcaSlicer/resources/profiles/OrcaFilamentLibrary*`
@@ -63,7 +66,7 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
 ## Directory map
 | Path | Purpose |
 |---|---|
-| `Snapmaker.json` | Bundle index. `version` (line 3, `02.03.04.11+a250t`), `machine_model_list`, `process_list` (:84), `filament_list` (:534), `machine_list` (:1788). Each entry `{name, sub_path}`. |
+| `Snapmaker.json` | Bundle index. `version` (line 3, `02.03.04.12+a250t`), `machine_model_list`, `process_list` (:84), `filament_list` (:534), `machine_list` (:1788). Each entry `{name, sub_path}`. |
 | `Snapmaker/machine/` (119) | `Snapmaker <Model>.json` (type `machine_model`), `fdm_*` abstract bases, `Snapmaker <Model> (<n> nozzle).json` printers. |
 | `Snapmaker/process/` (112) | `fdm_process_*` bases; `0.xx <Quality> @Snapmaker[ J1| Artisan| U1] (<n> nozzle).json`. SM2 uses plain `@Snapmaker`. |
 | `Snapmaker/filament/` (316) | `fdm_filament_common`, `fdm_filament_<type>_category` bases; `Snapmaker <type>[ @Dual][ @U1][ @0.x nozzle]`, `Generic ...`, Polymaker. |
@@ -86,8 +89,10 @@ and this repo's `Snapmaker/` + `Snapmaker.json` to `<S>/resources/profiles/`, th
   which Artisan/J1 also use).
 - `fdm_linear2.json`: SM2 limits (accel X1100/Y1000/Z100 = firmware Z, BK bases no longer override Z; speed 150/150/40 mm/s, jerk 5/1/1/3), thumbnails `300x150`.
 - `fdm_a250.json:9-14`: `printable_area` 230x250, `printable_height` 230, `printer_notes PRINTER_MODEL_SNAPMAKER_A250`,
-  `machine_pause_gcode M600` (:12), start/end G-code (`; Update: 20250313`). Start G-code (all 4 bases): flush temp
-  `min(<275 single|290 Dual>, min(nozzle_temperature_range_high, max(250, first_layer + 15)))`; hot-bed +0.06 mm
+  `machine_pause_gcode` (:12, `M600`; F10 is fixed in the controller a250t.12, not here), `host_type snapmaker2`, `disable_m73 1`,
+  `machine_max_junction_deviation 0.02`, `layer_change_gcode` (F1), start/end G-code (`; Update: 20250313`). Start
+  G-code: flush temp single `min(275, min(nozzle_temperature_range_high, first_layer + 15))` (F3), Dual
+  `min(290, min(nozzle_temperature_range_high, max(250, first_layer + 15)))`; hot-bed +0.06 mm
   (bed >= 90 C) applied as `G0 Z1.66` + `G92 Z1.6` (`; SM2_HOTBED_COMP` comment), never at Z0.06 near the bed.
   Purge (PR-09): `{local sm2_*}` lines right after the header pick a 100 mm two-pass line in front of the first-layer
   footprint, else left, else right (15/10 mm from it, X 10 mm inside the bed, never behind it), else the old X40 Y0
@@ -174,6 +179,10 @@ Smart park 08/11/2026: df0f9fc flush/park point derived from the purge start + r
 PR-23 08/11/2026: f77ad16 opt-in adaptive `G1029 A L R F B` after `M190 R` (single-head bases, `printer_notes` token
 `SM2_ADAPTIVE_MESH`) + renderer regex/`--adaptive` + rule SM2-GC-MESH + tests (71); b9210bb version 02.03.04.11+a250t
 (local, not pushed; gitlink not moved).
+Machine-test fixes 10/11/2026 (UNCOMMITTED): F1 sacrificial layer-2 M104/M140 (screen 165/70 rewrite), F3 single
+flush first layer + 15, F6 host_type snapmaker2, F8 junction deviation 0.02,
+F11 disable_m73; rules SM2-GC-SCREENTEMP/CFG; tests 82; version 02.03.04.12+a250t. F10 (pause temperature) was tried as a
+pause-G-code trick and dropped after review on 10/11/2026: the controller a250t.12 restores the pre-pause target itself.
 Fix list:
 `../_snapmaker2-review/issues/snapmaker-profiles.md`. Details:
 `../_snapmaker2-review/integration/snapmaker-profiles.md`.
